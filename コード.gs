@@ -1,977 +1,1683 @@
-/*********************************
- * 決算書PDF × Excel 突合ツール（GAS完結版）
- * - ブックマークレットで folderId を受け取る
- * - フォルダ直下の決算書PDFとExcelを取得
- * - Excelは一時変換して5行目以降が空欄なら old フォルダへ移動
- * - 採用Excelは A列=勘定科目 / F列=金額 で集計
- * - 決算書PDFは一時Googleドキュメント化して貸借対照表から科目残高抽出
- * - 決算書BS残高とExcel集計残高を突合
- *********************************/
-
-const APP_VERSION = '2026-04-10.02';
+/*************************************************
+ * 決算チェックツール 完全版
+ * v2026-04-11.02
+ *
+ * できること
+ * - DriveフォルダIDを受け取り
+ * - 同じフォルダに結果スプレッドシートを作成
+ * - テンプレート（このGASが紐づくスプレッドシート）を丸ごとコピー
+ * - フォルダ内の Googleスプレッドシート / Excel を取り込み
+ * - 変換に使った一時スプレッドシートと元Excelを old フォルダへ移動
+ * - runChecksCore_ で照合
+ * - check_result / check_log / report_A4 を出力
+ * - 入力値の全般異常チェック + Gemini補助判定
+ *
+ * 注意
+ * - PDFのOCR読取はこの版では未実装
+ * - 決算書は「決算書」というシート名で結果ブックに入る前提
+ * - Advanced Drive API を ON にしてください
+ * - スクリプトプロパティ:
+ *     GEMINI_API_KEY = Gemini API Key（任意）
+ *************************************************/
 
 const CONFIG = {
-  RESULT_FILE_PREFIX: '決算書Excelチェック結果',
-  TZ: Session.getScriptTimeZone() || 'Asia/Tokyo',
+  TEMPLATE_SHEET_ID: '', // 空欄ならこのGASが紐づくスプレッドシートを使う
+  RESULT_FILE_PREFIX: '決算チェック_',
 
-  DELETE_TEMP_CONVERTED_SHEETS: true,
-  DELETE_TEMP_CONVERTED_DOCS: true,
+  SHEET_DECISION: '決算書',
+  SHEET_RULES_MAIN: 'rules_main',
+  SHEET_RULES_KOKYO: 'rules_kokyo',
+  SHEET_GROUP_MASTER: 'account_group_master',
+  SHEET_NORMALIZE_MASTER: 'account_normalize_master',
+  SHEET_EXCLUDE_MASTER: 'account_exclude_master',
 
-  SHEET_NAMES: {
-    summary: '実行サマリ',
-    files: 'ファイル一覧',
-    excelCheck: 'Excel判定結果',
-    adopted: '採用対象',
-    excelBalance: 'Excel残高集計',
-    bs: '決算書BS残高',
-    compare: '決算書突合',
-    log: 'ログ',
-  },
+  SHEET_KOKYO_FRONT: '概況書表面',
+  SHEET_KOKYO_BACK: '概況書裏面',
 
-  PDF_NAME_HINTS: ['決算', '決算書', '決算報告書', '貸借対照表', '損益計算書'],
+  SHEET_RESULT: 'check_result',
+  SHEET_LOG: 'check_log',
+  SHEET_REPORT: 'report_A4',
 };
 
-const CHECK_CONFIG = {
-  EXCEL_ACCOUNT_COL: 1, // A列
-  EXCEL_AMOUNT_COL: 6,  // F列
-  DATA_START_ROW: 5,
-};
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('照合ツール')
+    .addItem('照合実行（このブック）', 'runChecks')
+    .addItem('結果シート初期化', 'resetResultSheets')
+    .addItem('テスト実行（folderId手入力）', 'testRunFromPrompt')
+    .addToUi();
+}
 
-const EXCEL_MIME_TYPES = [
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  'application/vnd.ms-excel',
-  'application/vnd.ms-excel.sheet.macroEnabled.12',
-];
-
-/** =========================
- * 公開入口
+/* =========================
+ * Webアプリ入口
  * ========================= */
 
 function doGet(e) {
-  const action = (e && e.parameter && e.parameter.action) || '';
-  const folderId = (e && e.parameter && e.parameter.folderId) || '';
+  e = e || {};
+  const params = e.parameter || {};
+  const action = params.action || '';
+  const folderId = params.folderId || '';
 
-  try {
-    if (action === 'run') {
-      if (!folderId) throw new Error('folderId が指定されていません。');
-
-      const result = runCheckSetupByFolderId_(folderId);
-      return HtmlService.createHtmlOutput(renderHtmlResult_(result))
-        .setTitle('決算書Excelチェック起動結果');
-    }
-
-    return HtmlService.createHtmlOutput([
-      '<h3>決算書Excelチェック起動GAS</h3>',
-      '<p>ブックマークレットから起動してください。</p>',
-      '<p>パラメータ: ?action=run&folderId=...</p>'
-    ].join(''));
-  } catch (err) {
-    return HtmlService.createHtmlOutput(
-      '<h3>エラー</h3><pre>' + escapeHtml_(String(err && err.stack || err)) + '</pre>'
-    );
+  if (!folderId) {
+    return ContentService.createTextOutput('folderId missing');
   }
+
+  if (action === 'run') {
+    const result = runFromFolder_(folderId);
+    return HtmlService
+      .createHtmlOutput(
+        `<p>処理が完了しました。</p><p><a href="${result.url}" target="_blank">結果スプレッドシートを開く</a></p>`
+      )
+      .setTitle('決算チェック');
+  }
+
+  return ContentService.createTextOutput('no action');
 }
 
-/** =========================
- * メイン処理
+function testRunFromPrompt() {
+  const ui = SpreadsheetApp.getUi();
+  const res = ui.prompt('folderIdを入力してください');
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  const folderId = res.getResponseText().trim();
+  if (!folderId) {
+    ui.alert('folderIdが空です');
+    return;
+  }
+  const result = runFromFolder_(folderId);
+  ui.alert(`完了しました\n${result.url}`);
+}
+
+/* =========================
+ * フォルダ単位実行
  * ========================= */
 
-function runCheckSetupByFolderId_(folderId) {
-  const startedAt = new Date();
-  const logs = [];
-  log_(logs, 'START', '処理開始 folderId=' + folderId);
-
+function runFromFolder_(folderId) {
   const folder = DriveApp.getFolderById(folderId);
-  log_(logs, 'INFO', 'フォルダ名: ' + folder.getName());
-
-  const scanned = scanFolderFiles_(folder, logs);
-  const selectedPdf = selectMainFinancialPdf_(scanned.pdfFiles, logs);
-  const excelAnalysis = analyzeExcelFiles_(folder, scanned.excelFiles, logs);
-
-  const adoptedExcelFiles = excelAnalysis.filter(x => x.isTarget);
-  const skippedExcelFiles = excelAnalysis.filter(x => !x.isTarget);
-
-  log_(logs, 'INFO', '決算書PDF採用: ' + (selectedPdf ? selectedPdf.fileName : 'なし'));
-  log_(logs, 'INFO', 'Excel採用件数: ' + adoptedExcelFiles.length);
-  log_(logs, 'INFO', 'Excel除外件数: ' + skippedExcelFiles.length);
-
-  let excelBalance = { accountMap: {}, detailRows: [] };
-  let bsMap = {};
-  let comparisonRows = [];
-
-  if (adoptedExcelFiles.length) {
-    excelBalance = buildExcelAccountBalanceMap_(folder, adoptedExcelFiles, logs);
-    log_(logs, 'INFO', 'Excel残高集計科目数: ' + Object.keys(excelBalance.accountMap).length);
-  }
-
-  if (selectedPdf) {
-    bsMap = extractBsMapFromPdf_(folder, selectedPdf, logs);
-    log_(logs, 'INFO', '決算書BS科目数: ' + Object.keys(bsMap).length);
-  }
-
-  comparisonRows = compareBsVsExcel_(bsMap, excelBalance.accountMap);
-  log_(logs, 'INFO', '突合件数: ' + comparisonRows.length);
-
-  const resultSs = createResultSpreadsheet_({
-    folder,
-    folderId,
-    scanned,
-    selectedPdf,
-    excelAnalysis,
-    excelBalance,
-    bsMap,
-    comparisonRows,
-    startedAt,
-    logs,
-  });
-
-  log_(logs, 'DONE', '結果スプレッドシート作成: ' + resultSs.getUrl());
-
-  return {
-    ok: true,
-    folderId,
-    folderName: folder.getName(),
-    resultSpreadsheetId: resultSs.getId(),
-    resultSpreadsheetUrl: resultSs.getUrl(),
-    pdfCount: scanned.pdfFiles.length,
-    excelCount: scanned.excelFiles.length,
-    adoptedExcelCount: adoptedExcelFiles.length,
-    skippedExcelCount: skippedExcelFiles.length,
-    selectedPdfName: selectedPdf ? selectedPdf.fileName : '',
-  };
-}
-
-/** =========================
- * フォルダ走査
- * ========================= */
-
-function scanFolderFiles_(folder, logs) {
-  const allFiles = [];
-  const pdfFiles = [];
-  const excelFiles = [];
-  const otherFiles = [];
-
-  const it = folder.getFiles();
-  while (it.hasNext()) {
-    const f = it.next();
-    const info = {
-      fileId: f.getId(),
-      fileName: f.getName(),
-      mimeType: f.getMimeType(),
-      url: 'https://drive.google.com/file/d/' + f.getId() + '/view',
-      size: safeGetSize_(f),
-      updatedAt: safeGetUpdatedAt_(f),
-    };
-
-    allFiles.push(info);
-
-    if (isPdfFile_(info)) {
-      pdfFiles.push(info);
-    } else if (isExcelFile_(info)) {
-      excelFiles.push(info);
-    } else {
-      otherFiles.push(info);
-    }
-  }
-
-  log_(logs, 'INFO', '全ファイル数: ' + allFiles.length);
-  log_(logs, 'INFO', 'PDF件数: ' + pdfFiles.length);
-  log_(logs, 'INFO', 'Excel件数: ' + excelFiles.length);
-  log_(logs, 'INFO', 'その他件数: ' + otherFiles.length);
-
-  return {
-    allFiles,
-    pdfFiles,
-    excelFiles,
-    otherFiles,
-  };
-}
-
-function isPdfFile_(fileInfo) {
-  return fileInfo.mimeType === MimeType.PDF || /\.pdf$/i.test(fileInfo.fileName);
-}
-
-function isExcelFile_(fileInfo) {
-  if (EXCEL_MIME_TYPES.includes(fileInfo.mimeType)) return true;
-  return /\.(xlsx|xlsm|xls)$/i.test(fileInfo.fileName);
-}
-
-function safeGetSize_(file) {
-  try {
-    return file.getSize();
-  } catch (e) {
-    return '';
-  }
-}
-
-function safeGetUpdatedAt_(file) {
-  try {
-    return file.getLastUpdated();
-  } catch (e) {
-    return '';
-  }
-}
-
-/** =========================
- * old フォルダ
- * ========================= */
-
-function getOrCreateOldFolder_(parentFolder) {
-  const name = 'old';
-  const it = parentFolder.getFoldersByName(name);
-  if (it.hasNext()) return it.next();
-  return parentFolder.createFolder(name);
-}
-
-/** =========================
- * 決算書PDF選定
- * ========================= */
-
-function selectMainFinancialPdf_(pdfFiles, logs) {
-  if (!pdfFiles || !pdfFiles.length) return null;
-
-  const scored = pdfFiles.map(f => {
-    const name = String(f.fileName || '');
-    let score = 0;
-
-    CONFIG.PDF_NAME_HINTS.forEach(hint => {
-      if (name.indexOf(hint) >= 0) score += 10;
-    });
-
-    if (/決算書/i.test(name)) score += 20;
-    if (/決算報告書/i.test(name)) score += 20;
-
-    return Object.assign({}, f, { score });
-  });
-
-  scored.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    return String(a.fileName).localeCompare(String(b.fileName), 'ja');
-  });
-
-  const selected = scored[0] || null;
-  if (selected) {
-    log_(logs, 'INFO', '採用PDF: ' + selected.fileName + ' / score=' + selected.score);
-  }
-
-  return selected;
-}
-
-/** =========================
- * Excel変換・判定
- * ========================= */
-
-function convertExcelToGoogleSheet_(folder, fileInfo) {
-  const originalFile = DriveApp.getFileById(fileInfo.fileId);
-  const blob = originalFile.getBlob();
-
-  const resource = {
-    name: '[TEMP]_' + fileInfo.fileName + '_' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyyMMdd_HHmmss'),
-    mimeType: MimeType.GOOGLE_SHEETS,
-    parents: [folder.getId()],
-  };
-
-  const converted = Drive.Files.create(resource, blob, {
-    supportsAllDrives: true,
-  });
-
-  return {
-    spreadsheetId: converted.id,
-    spreadsheetUrl: 'https://docs.google.com/spreadsheets/d/' + converted.id + '/edit',
-  };
-}
-
-function inspectConvertedSpreadsheet_(spreadsheetId) {
-  const ss = SpreadsheetApp.openById(spreadsheetId);
-  const sheets = ss.getSheets();
-
-  let hasDataAfterRow5 = false;
-  const nonEmptySheetNames = [];
-  let checkedSheetCount = 0;
-
-  sheets.forEach(sh => {
-    checkedSheetCount++;
-
-    const lastRow = sh.getLastRow();
-    const lastCol = sh.getLastColumn();
-
-    if (lastRow < CHECK_CONFIG.DATA_START_ROW || lastCol < 1) return;
-
-    const startRow = CHECK_CONFIG.DATA_START_ROW;
-    const numRows = lastRow - startRow + 1;
-    if (numRows <= 0) return;
-
-    const values = sh.getRange(startRow, 1, numRows, lastCol).getDisplayValues();
-    const hasAny = values.some(row => row.some(v => String(v).trim() !== ''));
-
-    if (hasAny) {
-      hasDataAfterRow5 = true;
-      nonEmptySheetNames.push(sh.getName());
-    }
-  });
-
-  return {
-    hasDataAfterRow5,
-    nonEmptySheetNames,
-    checkedSheetCount,
-  };
-}
-
-function analyzeExcelFiles_(folder, excelFiles, logs) {
-  const results = [];
   const oldFolder = getOrCreateOldFolder_(folder);
 
-  for (let i = 0; i < excelFiles.length; i++) {
-    const fileInfo = excelFiles[i];
-    log_(logs, 'INFO', 'Excel判定開始: ' + fileInfo.fileName);
+  const templateSs = getTemplateSpreadsheet_();
+  const resultSs = createResultSpreadsheetFromTemplate_(templateSs, folder);
 
-    let tempSpreadsheetId = '';
-    let tempSpreadsheetUrl = '';
-    let isTarget = false;
-    let hasDataAfterRow5 = false;
-    let nonEmptySheetNames = [];
-    let checkedSheetCount = 0;
-    let error = '';
-    let statusJa = '';
+  importFilesFromFolder_(folder, oldFolder, resultSs);
+  runChecksCore_(resultSs);
 
-    try {
-      const converted = convertExcelToGoogleSheet_(folder, fileInfo);
-      tempSpreadsheetId = converted.spreadsheetId;
-      tempSpreadsheetUrl = converted.spreadsheetUrl;
+  return {
+    spreadsheetId: resultSs.getId(),
+    url: resultSs.getUrl(),
+  };
+}
 
-      const check = inspectConvertedSpreadsheet_(tempSpreadsheetId);
-      hasDataAfterRow5 = check.hasDataAfterRow5;
-      nonEmptySheetNames = check.nonEmptySheetNames;
-      checkedSheetCount = check.checkedSheetCount;
+function getTemplateSpreadsheet_() {
+  if (CONFIG.TEMPLATE_SHEET_ID) {
+    return SpreadsheetApp.openById(CONFIG.TEMPLATE_SHEET_ID);
+  }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error('テンプレートスプレッドシートを取得できません。CONFIG.TEMPLATE_SHEET_ID を設定してください。');
+  }
+  return ss;
+}
 
-      isTarget = hasDataAfterRow5;
+function createResultSpreadsheetFromTemplate_(templateSs, folder) {
+  const templateFile = DriveApp.getFileById(templateSs.getId());
+  const name = `${CONFIG.RESULT_FILE_PREFIX}${getNowStr_()}`;
+  const copiedFile = templateFile.makeCopy(name, folder);
+  return SpreadsheetApp.openById(copiedFile.getId());
+}
 
-      if (isTarget) {
-        statusJa = 'OK（使用）';
-      } else {
-        statusJa = '空欄（oldへ移動）';
-        try {
-          const file = DriveApp.getFileById(fileInfo.fileId);
-          oldFolder.addFile(file);
-          folder.removeFile(file);
-          log_(logs, 'INFO', 'oldフォルダへ移動: ' + fileInfo.fileName);
-        } catch (moveErr) {
-          log_(logs, 'WARN', 'old移動失敗: ' + fileInfo.fileName + ' / ' + moveErr);
-        }
-      }
+function importFilesFromFolder_(folder, oldFolder, resultSs) {
+  const files = folder.getFiles();
 
-      log_(logs, 'INFO',
-        'Excel判定完了: ' + fileInfo.fileName +
-        ' / status=' + statusJa +
-        ' / nonEmptySheets=' + nonEmptySheetNames.join(', ')
-      );
+  while (files.hasNext()) {
+    const file = files.next();
+    const fileId = file.getId();
+    const fileName = file.getName();
+    const mimeType = file.getMimeType();
 
-    } catch (e) {
-      error = String(e && e.message || e);
-      statusJa = '判定失敗';
-      log_(logs, 'ERROR', 'Excel判定失敗: ' + fileInfo.fileName + ' / ' + error);
-    } finally {
-      if (tempSpreadsheetId && CONFIG.DELETE_TEMP_CONVERTED_SHEETS) {
-        try {
-          DriveApp.getFileById(tempSpreadsheetId).setTrashed(true);
-        } catch (e) {
-          log_(logs, 'WARN', '一時変換Sheet削除失敗: ' + tempSpreadsheetId);
-        }
-      }
+    if (fileId === resultSs.getId()) continue;
+    if (fileId === getTemplateSpreadsheet_().getId()) continue;
+    if (fileName === 'old') continue;
+
+    if (mimeType === MimeType.GOOGLE_SHEETS) {
+      importGoogleSpreadsheetFile_(file, resultSs);
+      continue;
     }
 
-    results.push({
-      fileId: fileInfo.fileId,
-      fileName: fileInfo.fileName,
-      mimeType: fileInfo.mimeType,
-      url: fileInfo.url,
-      tempSpreadsheetId,
-      tempSpreadsheetUrl,
-      checkedSheetCount,
-      hasDataAfterRow5,
-      nonEmptySheetNames,
-      isTarget,
-      statusJa,
-      error,
-    });
+    if (isExcelMimeType_(mimeType) || /\.xlsx?$/i.test(fileName)) {
+      importExcelFile_(file, folder, oldFolder, resultSs);
+      continue;
+    }
+
+    if (mimeType === MimeType.PDF || /\.pdf$/i.test(fileName)) {
+      appendLogRow_(resultSs, `PDFは未取込（OCR未実装）: ${fileName}`);
+      continue;
+    }
+  }
+}
+
+function importGoogleSpreadsheetFile_(file, resultSs) {
+  const sourceSs = SpreadsheetApp.openById(file.getId());
+  copySourceSheets_(sourceSs, resultSs, file.getName());
+  appendLogRow_(resultSs, `Googleスプレッドシート取込: ${file.getName()}`);
+}
+
+function importExcelFile_(file, folder, oldFolder, resultSs) {
+  const tempSs = convertExcelToSpreadsheet_(file, folder);
+
+  try {
+    copySourceSheets_(tempSs, resultSs, file.getName());
+    appendLogRow_(resultSs, `Excel取込: ${file.getName()}`);
+  } finally {
+    moveFileToFolder_(DriveApp.getFileById(tempSs.getId()), oldFolder);
+    moveFileToFolder_(file, oldFolder);
+  }
+}
+
+function convertExcelToSpreadsheet_(file, folder) {
+  const blob = file.getBlob();
+
+  const resource = {
+    title: `[tmp]${file.getName()}`,
+    mimeType: MimeType.GOOGLE_SHEETS,
+    parents: [{ id: folder.getId() }],
+  };
+
+  const converted = Drive.Files.insert(resource, blob);
+  return SpreadsheetApp.openById(converted.id);
+}
+
+function copySourceSheets_(sourceSs, targetSs, sourceFileName) {
+  const sheets = sourceSs.getSheets();
+  const multiple = sheets.length > 1;
+
+  for (let i = 0; i < sheets.length; i++) {
+    const sh = sheets[i];
+    const targetName = buildImportedSheetName_(sourceFileName, sh.getName(), multiple, i);
+
+    const existing = targetSs.getSheetByName(targetName);
+    if (existing) targetSs.deleteSheet(existing);
+
+    const copied = sh.copyTo(targetSs);
+    copied.setName(targetName);
+  }
+}
+
+function buildImportedSheetName_(fileName, originalSheetName, multiple, index) {
+  const base = stripExtension_(fileName);
+
+  if (base.includes('法人事業概況説明書') && base.includes('表面')) {
+    return CONFIG.SHEET_KOKYO_FRONT;
+  }
+  if (base.includes('法人事業概況説明書') && base.includes('裏面')) {
+    return CONFIG.SHEET_KOKYO_BACK;
+  }
+  if (base.includes('決算書')) {
+    return CONFIG.SHEET_DECISION;
+  }
+
+  let name = multiple ? `${base}_${originalSheetName}` : base;
+  name = name.replace(/[\\\/\?\*\[\]:]/g, '_');
+  return name.substring(0, 95);
+}
+
+function stripExtension_(name) {
+  return String(name || '').replace(/\.[^/.]+$/,'');
+}
+
+function isExcelMimeType_(mimeType) {
+  return [
+    MimeType.MICROSOFT_EXCEL,
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-excel',
+  ].includes(mimeType);
+}
+
+function getOrCreateOldFolder_(parentFolder) {
+  const folders = parentFolder.getFoldersByName('old');
+  if (folders.hasNext()) return folders.next();
+  return parentFolder.createFolder('old');
+}
+
+function moveFileToFolder_(file, targetFolder) {
+  const parents = file.getParents();
+  while (parents.hasNext()) {
+    const p = parents.next();
+    if (p.getId() === targetFolder.getId()) return;
+  }
+
+  targetFolder.addFile(file);
+
+  const parents2 = file.getParents();
+  while (parents2.hasNext()) {
+    const p = parents2.next();
+    if (p.getId() !== targetFolder.getId()) {
+      p.removeFile(file);
+    }
+  }
+}
+
+/* =========================
+ * 手動実行（このブック）
+ * ========================= */
+
+function runChecks() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  runChecksCore_(ss);
+}
+
+function runChecksCore_(ss) {
+  const startedAt = new Date();
+
+  ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_RESULT);
+  ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_LOG);
+  resetResultSheetsInSpreadsheet_(ss);
+
+  try {
+    appendLogRow_(ss, '照合開始');
+
+    const ctx = buildContext_(ss);
+
+    const mainResults = runMainRules_(ss, ctx);
+    const kokyoResults = runKokyoRules_(ss, ctx);
+    const typoResults = runGlobalInputAnomalyChecks_(ss);
+
+    const allResults = [...mainResults, ...kokyoResults, ...typoResults];
+    writeResults_(ss, allResults);
+    buildA4Report_(ss);
+
+    appendLogRow_(ss, `照合完了 件数=${allResults.length}`);
+  } catch (err) {
+    appendLogRow_(ss, `ERROR: ${err.stack || err}`);
+    throw err;
+  } finally {
+    const sec = Math.round((new Date() - startedAt) / 1000);
+    appendLogRow_(ss, `処理時間 ${sec} 秒`);
+  }
+}
+
+function resetResultSheets() {
+  resetResultSheetsInSpreadsheet_(SpreadsheetApp.getActiveSpreadsheet());
+}
+
+function resetResultSheetsInSpreadsheet_(ss) {
+  const result = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_RESULT);
+  result.clearContents().clearFormats();
+  result.getRange(1, 1, 1, 18).setValues([[
+    '判定',
+    '区分',
+    'ルールID',
+    '対象シート',
+    '対象項目',
+    '対象セル',
+    'ジャンプURL',
+    '決算書値',
+    '比較値',
+    '差額',
+    '条件',
+    'メッセージ',
+    '詳細',
+    'AI判定',
+    'AI理由',
+    'AI修正候補1',
+    'AI修正候補2',
+    '日時',
+  ]]);
+
+  const log = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_LOG);
+  log.clearContents().clearFormats();
+  log.getRange(1, 1, 1, 2).setValues([['日時', 'ログ']]);
+
+  const report = ss.getSheetByName(CONFIG.SHEET_REPORT);
+  if (report) ss.deleteSheet(report);
+}
+
+function buildContext_(ss) {
+  const decisionSheet = getRequiredSheet_(ss, CONFIG.SHEET_DECISION);
+  const decisionMap = parseDecisionSheet_(decisionSheet);
+
+  return {
+    ss,
+    decisionMap,
+    groups: loadGroupMaster_(ss),
+    normalizeRules: loadNormalizeMaster_(ss),
+    excludeMaster: loadExcludeMaster_(ss),
+    rulesMain: loadRulesMain_(ss),
+    rulesKokyo: loadRulesKokyo_(ss),
+  };
+}
+
+/* =========================
+ * rules_main
+ * ========================= */
+
+function runMainRules_(ss, ctx) {
+  const results = [];
+
+  for (const rule of ctx.rulesMain) {
+    if (!toBoolean_(rule.enabled)) continue;
+
+    const targetSheet = findTargetSheetByPattern_(ss, rule.file_pattern);
+    if (!targetSheet) {
+      results.push(makeResult_({
+        status: '要確認',
+        category: '内訳書',
+        ruleId: rule.rule_id,
+        sheetName: '',
+        itemName: rule.document_type,
+        targetCell: '',
+        jumpUrl: '',
+        decisionValue: '',
+        compareValue: '',
+        diff: '',
+        condition: 'シート未検出',
+        message: `対象シートが見つかりません: ${rule.file_pattern}`,
+        detail: '',
+      }));
+      continue;
+    }
+
+    const sheetData = getSheetValues_(targetSheet);
+    const rows = sheetData.values;
+    const display = sheetData.displayValues;
+
+    try {
+      switch (rule.check_type) {
+        case 'SUM_MATCH':
+          results.push(...checkSumMatch_(rule, targetSheet, rows, ctx));
+          break;
+        case 'SUM_BY_ACCOUNT':
+          results.push(...checkSumByAccount_(rule, targetSheet, rows, ctx));
+          break;
+        case 'GROUP_SUM':
+          results.push(...checkGroupSum_(rule, targetSheet, rows, ctx));
+          break;
+        case 'FIXED_VALUE':
+          results.push(...checkFixedValue_(rule, targetSheet, display, ctx));
+          break;
+        case 'NOT_BLANK_WHEN_PRESENT':
+          results.push(...checkNotBlankWhenPresent_(rule, targetSheet, display));
+          break;
+        case 'NOT_BLANK_WHEN_AMOUNT_EXISTS':
+          results.push(...checkNotBlankWhenAmountExists_(rule, targetSheet, rows));
+          break;
+        case 'HEADER_CHECK':
+          results.push(...checkHeader_(rule, targetSheet, display));
+          break;
+        case 'TITLE_CHECK':
+          results.push(...checkTitle_(rule, targetSheet, display));
+          break;
+        case 'NORMALIZE_SUM':
+          results.push(...checkNormalizeSum_(rule, targetSheet, rows, ctx));
+          break;
+        default:
+          results.push(makeResult_({
+            status: '要確認',
+            category: '内訳書',
+            ruleId: rule.rule_id,
+            sheetName: targetSheet.getName(),
+            itemName: rule.document_type,
+            targetCell: '',
+            jumpUrl: '',
+            decisionValue: '',
+            compareValue: '',
+            diff: '',
+            condition: rule.check_type,
+            message: `未対応のcheck_typeです: ${rule.check_type}`,
+            detail: '',
+          }));
+      }
+    } catch (err) {
+      results.push(makeResult_({
+        status: '要確認',
+        category: '内訳書',
+        ruleId: rule.rule_id,
+        sheetName: targetSheet.getName(),
+        itemName: rule.document_type,
+        targetCell: '',
+        jumpUrl: '',
+        decisionValue: '',
+        compareValue: '',
+        diff: '',
+        condition: '実行エラー',
+        message: `ルール実行中にエラー: ${err.message}`,
+        detail: err.stack || '',
+      }));
+    }
   }
 
   return results;
 }
 
-/** =========================
- * Excel集計
- * ========================= */
+function checkSumMatch_(rule, sheet, rows, ctx) {
+  let amountCol = colToIndex_(rule.amount_col);
+  let headerRow = findHeaderRowByText_(rows, rule.header_name, amountCol);
 
-function buildExcelAccountBalanceMap_(folder, adoptedExcelFiles, logs) {
-  const accountMap = {};
-  const detailRows = [];
+  if (headerRow < 0) {
+    const found = findCellByText_(sheet.getDataRange().getDisplayValues(), rule.header_name);
+    if (found) {
+      headerRow = found.row;
+      amountCol = found.col;
+    }
+  }
 
-  for (const fileInfo of adoptedExcelFiles) {
-    let tempSpreadsheetId = '';
-    try {
-      const converted = convertExcelToGoogleSheet_(folder, fileInfo);
-      tempSpreadsheetId = converted.spreadsheetId;
+  if (headerRow < 0) return [ngHeaderNotFound_(rule, sheet)];
 
-      const ss = SpreadsheetApp.openById(tempSpreadsheetId);
-      const sheets = ss.getSheets();
+  const sum = sumColumnBelowHeader_(rows, headerRow, amountCol);
+  const target = resolveDecisionTargetValue_(rule, ctx);
+  const a1 = toA1_(headerRow + 1, amountCol + 1);
 
-      sheets.forEach(sh => {
-        const lastRow = sh.getLastRow();
-        const lastCol = sh.getLastColumn();
-        if (lastRow < CHECK_CONFIG.DATA_START_ROW || lastCol < CHECK_CONFIG.EXCEL_AMOUNT_COL) return;
+  return [compareNumbersResult_(rule, sheet.getName(), rule.header_name || rule.target_account || rule.target_account_group, target, sum, '内訳書', a1, buildRangeUrl_(ctx.ss, sheet.getName(), a1))];
+}
 
-        const numRows = lastRow - CHECK_CONFIG.DATA_START_ROW + 1;
-        const values = sh.getRange(
-          CHECK_CONFIG.DATA_START_ROW,
-          1,
-          numRows,
-          Math.max(lastCol, CHECK_CONFIG.EXCEL_AMOUNT_COL)
-        ).getDisplayValues();
+function checkSumByAccount_(rule, sheet, rows, ctx) {
+  const accountCol = colToIndex_(rule.account_col);
+  let amountCol = colToIndex_(rule.amount_col);
 
-        values.forEach((row, idx) => {
-          const rawAccount = String(row[CHECK_CONFIG.EXCEL_ACCOUNT_COL - 1] || '').trim();
-          const rawAmount = String(row[CHECK_CONFIG.EXCEL_AMOUNT_COL - 1] || '').trim();
+  let headerRow = findHeaderRowByText_(rows, rule.header_name, amountCol);
 
-          if (!rawAccount && !rawAmount) return;
+  if (normalizeText_(rule.file_pattern).includes('売掛金の内訳')) {
+    const accountHeaderRow = findHeaderRowByText_(rows, '種類', accountCol);
+    if (accountHeaderRow >= 0) headerRow = accountHeaderRow;
+  }
 
-          const account = rawAccount || inferAccountFromFileName_(fileInfo.fileName);
-          const amount = parseAmount_(rawAmount);
+  if (headerRow < 0) {
+    const found = findCellByText_(sheet.getDataRange().getDisplayValues(), rule.header_name);
+    if (found) {
+      headerRow = found.row;
+      amountCol = found.col;
+    }
+  }
 
-          if (!account || amount === null) return;
+  if (headerRow < 0) return [ngHeaderNotFound_(rule, sheet)];
 
-          if (!accountMap[account]) accountMap[account] = 0;
-          accountMap[account] += amount;
+  const exclude = mergeExcludeAccounts_(rule.exclude_accounts, ctx.excludeMaster);
+  const sums = {};
+  const rowMap = {};
 
-          detailRows.push({
-            fileName: fileInfo.fileName,
-            sheetName: sh.getName(),
-            rowNo: CHECK_CONFIG.DATA_START_ROW + idx,
-            account,
-            amount,
-          });
-        });
-      });
+  for (let r = headerRow + 1; r < rows.length; r++) {
+    const account = normalizeText_(rows[r][accountCol]);
+    if (!account) continue;
+    if (isSectionLike_(account)) continue;
+    if (exclude.has(account)) continue;
 
-      log_(logs, 'INFO', 'Excel集計完了: ' + fileInfo.fileName);
+    const amount = toNumber_(rows[r][amountCol]);
+    if (amount == null) continue;
 
-    } catch (e) {
-      log_(logs, 'ERROR', 'Excel集計失敗: ' + fileInfo.fileName + ' / ' + e);
-    } finally {
-      if (tempSpreadsheetId && CONFIG.DELETE_TEMP_CONVERTED_SHEETS) {
-        try {
-          DriveApp.getFileById(tempSpreadsheetId).setTrashed(true);
-        } catch (e) {}
+    sums[account] = (sums[account] || 0) + amount;
+    if (!rowMap[account]) rowMap[account] = r;
+  }
+
+  const results = [];
+  Object.keys(sums).sort().forEach(account => {
+    const a1 = toA1_(rowMap[account] + 1, amountCol + 1);
+    const jumpUrl = buildRangeUrl_(ctx.ss, sheet.getName(), a1);
+    const decisionValue = ctx.decisionMap[account];
+
+    if (decisionValue == null) {
+      results.push(makeResult_({
+        status: 'SKIP',
+        category: '内訳書',
+        ruleId: rule.rule_id,
+        sheetName: sheet.getName(),
+        itemName: account,
+        targetCell: a1,
+        jumpUrl: jumpUrl,
+        decisionValue: '',
+        compareValue: sums[account],
+        diff: '',
+        condition: '決算書科目なし',
+        message: '決算書に対象科目が無いためスキップ',
+        detail: '',
+      }));
+      return;
+    }
+
+    results.push(compareNumbersResult_(rule, sheet.getName(), account, decisionValue, sums[account], '内訳書', a1, jumpUrl));
+  });
+
+  if (results.length === 0) {
+    results.push(makeResult_({
+      status: '要確認',
+      category: '内訳書',
+      ruleId: rule.rule_id,
+      sheetName: sheet.getName(),
+      itemName: rule.document_type,
+      targetCell: '',
+      jumpUrl: '',
+      decisionValue: '',
+      compareValue: '',
+      diff: '',
+      condition: '比較対象なし',
+      message: '決算書と一致判定できる科目が見つかりませんでした',
+      detail: '',
+    }));
+  }
+
+  return results;
+}
+
+function checkGroupSum_(rule, sheet, rows, ctx) {
+  const displayValues = sheet.getDataRange().getDisplayValues();
+
+  let amountCol = colToIndex_(rule.amount_col);
+  let headerRow = findHeaderRowByText_(displayValues, rule.header_name, amountCol);
+
+  if (headerRow < 0) {
+    const found = findCellByText_(displayValues, rule.header_name);
+    if (found) {
+      headerRow = found.row;
+      amountCol = found.col;
+    }
+  }
+
+  if (headerRow < 0) return [ngHeaderNotFound_(rule, sheet)];
+
+  const sum = sumColumnBelowHeader_(rows, headerRow, amountCol);
+  const target = resolveDecisionTargetValue_(rule, ctx);
+  const a1 = toA1_(headerRow + 1, amountCol + 1);
+
+  return [compareNumbersResult_(rule, sheet.getName(), rule.target_account_group || rule.header_name, target, sum, '内訳書', a1, buildRangeUrl_(ctx.ss, sheet.getName(), a1))];
+}
+
+function checkFixedValue_(rule, sheet, displayValues, ctx) {
+  const found = findCellByText_(displayValues, rule.header_name);
+  if (!found) {
+    return [makeResult_({
+      status: '要確認',
+      category: '内訳書',
+      ruleId: rule.rule_id,
+      sheetName: sheet.getName(),
+      itemName: rule.header_name,
+      targetCell: '',
+      jumpUrl: '',
+      decisionValue: '',
+      compareValue: '',
+      diff: '',
+      condition: '固定項目未検出',
+      message: `${rule.header_name} が見つかりません`,
+      detail: '',
+    })];
+  }
+
+  const value = findRightNumericValue_(displayValues, found.row, found.col);
+  const target = resolveDecisionTargetValue_(rule, ctx);
+  const a1 = toA1_(found.row + 1, found.col + 1);
+
+  return [compareNumbersResult_(rule, sheet.getName(), rule.header_name, target, value, '内訳書', a1, buildRangeUrl_(ctx.ss, sheet.getName(), a1))];
+}
+
+function checkNotBlankWhenPresent_(rule, sheet, displayValues) {
+  const found = findCellByText_(displayValues, rule.header_name);
+  if (!found) {
+    return [makeResult_({
+      status: '要確認',
+      category: '内訳書',
+      ruleId: rule.rule_id,
+      sheetName: sheet.getName(),
+      itemName: rule.header_name,
+      targetCell: '',
+      jumpUrl: '',
+      decisionValue: '',
+      compareValue: '',
+      diff: '',
+      condition: '固定項目未検出',
+      message: `${rule.header_name} が見つかりません`,
+      detail: '',
+    })];
+  }
+
+  const value = findRightTextValue_(displayValues, found.row, found.col);
+  const a1 = toA1_(found.row + 1, found.col + 1);
+
+  return [makeResult_({
+    status: value ? 'OK' : (rule.severity || '要確認'),
+    category: '内訳書',
+    ruleId: rule.rule_id,
+    sheetName: sheet.getName(),
+    itemName: rule.header_name,
+    targetCell: a1,
+    jumpUrl: buildRangeUrl_(SpreadsheetApp.getActiveSpreadsheet(), sheet.getName(), a1),
+    decisionValue: '',
+    compareValue: value || '',
+    diff: '',
+    condition: 'NOT_BLANK',
+    message: value ? 'OK' : rule.message,
+    detail: '',
+  })];
+}
+
+function checkNotBlankWhenAmountExists_(rule, sheet, rows) {
+  const amountCol = colToIndex_(rule.amount_col);
+  const targetBlankCol = colToIndex_('M');
+
+  let foundBlank = false;
+  let foundRow = -1;
+
+  for (let r = 0; r < rows.length; r++) {
+    const amount = toNumber_(rows[r][amountCol]);
+    if (amount != null && amount !== 0) {
+      const v = normalizeText_(rows[r][targetBlankCol]);
+      if (!v) {
+        foundBlank = true;
+        foundRow = r;
+        break;
       }
     }
   }
 
-  return {
-    accountMap,
-    detailRows,
-  };
+  const a1 = foundRow >= 0 ? toA1_(foundRow + 1, targetBlankCol + 1) : '';
+  return [makeResult_({
+    status: foundBlank ? (rule.severity || '要確認') : 'OK',
+    category: '内訳書',
+    ruleId: rule.rule_id,
+    sheetName: sheet.getName(),
+    itemName: rule.document_type,
+    targetCell: a1,
+    jumpUrl: a1 ? buildRangeUrl_(SpreadsheetApp.getActiveSpreadsheet(), sheet.getName(), a1) : '',
+    decisionValue: '',
+    compareValue: '',
+    diff: '',
+    condition: rule.condition || '',
+    message: foundBlank ? rule.message : 'OK',
+    detail: '',
+  })];
 }
 
-function parseAmount_(value) {
-  const s = String(value || '').replace(/,/g, '').replace(/△/g, '-').trim();
-  if (!s) return null;
-  const n = Number(s);
-  return isNaN(n) ? null : n;
+function checkHeader_(rule, sheet, displayValues) {
+  const found = findCellByText_(displayValues, rule.header_name);
+  const a1 = found ? toA1_(found.row + 1, found.col + 1) : '';
+
+  return [makeResult_({
+    status: found ? 'OK' : (rule.severity || 'NG'),
+    category: '内訳書',
+    ruleId: rule.rule_id,
+    sheetName: sheet.getName(),
+    itemName: rule.header_name,
+    targetCell: a1,
+    jumpUrl: a1 ? buildRangeUrl_(SpreadsheetApp.getActiveSpreadsheet(), sheet.getName(), a1) : '',
+    decisionValue: '',
+    compareValue: found ? rule.header_name : '',
+    diff: '',
+    condition: 'HEADER_CHECK',
+    message: found ? 'OK' : rule.message,
+    detail: '',
+  })];
 }
 
-function inferAccountFromFileName_(fileName) {
-  const name = String(fileName || '');
+function checkTitle_(rule, sheet, displayValues) {
+  const found = findCellByText_(displayValues, rule.header_name);
+  const a1 = found ? toA1_(found.row + 1, found.col + 1) : '';
 
-  if (name.indexOf('預貯金') >= 0) return '現金及び預金';
-  if (name.indexOf('売掛金') >= 0) return '売掛金';
-  if (name.indexOf('受取手形') >= 0) return '受取手形';
-  if (name.indexOf('棚卸資産') >= 0) return '仕掛品';
-  if (name.indexOf('仮払金') >= 0) return '仮払金';
-  if (name.indexOf('貸付金') >= 0) return '貸付金';
-  if (name.indexOf('買掛金') >= 0) return '買掛金';
-  if (name.indexOf('未払金') >= 0) return '未払金';
-  if (name.indexOf('未払費用') >= 0) return '未払費用';
-  if (name.indexOf('借入金') >= 0) return '長期借入金';
-  if (name.indexOf('役員給与') >= 0) return '役員報酬';
-  if (name.indexOf('地代家賃') >= 0) return '地代家賃';
-  if (name.indexOf('仮受金') >= 0) return '仮受金';
-  if (name.indexOf('固定資産') >= 0) return '固定資産';
-  if (name.indexOf('雑益') >= 0) return '雑益';
-  if (name.indexOf('雑損失') >= 0) return '雑損失';
+  return [makeResult_({
+    status: found ? 'OK' : (rule.severity || 'NG'),
+    category: '内訳書',
+    ruleId: rule.rule_id,
+    sheetName: sheet.getName(),
+    itemName: rule.header_name,
+    targetCell: a1,
+    jumpUrl: a1 ? buildRangeUrl_(SpreadsheetApp.getActiveSpreadsheet(), sheet.getName(), a1) : '',
+    decisionValue: '',
+    compareValue: found ? rule.header_name : '',
+    diff: '',
+    condition: 'TITLE_CHECK',
+    message: found ? 'OK' : rule.message,
+    detail: '',
+  })];
+}
+
+function checkNormalizeSum_(rule, sheet, rows, ctx) {
+  const accountCol = colToIndex_(rule.account_col);
+  let amountCol = colToIndex_(rule.amount_col);
+  let headerRow = findHeaderRowByText_(rows, rule.header_name, amountCol);
+
+  if (headerRow < 0) {
+    const found = findCellByText_(sheet.getDataRange().getDisplayValues(), rule.header_name);
+    if (found) {
+      headerRow = found.row;
+      amountCol = found.col;
+    }
+  }
+
+  if (headerRow < 0) return [ngHeaderNotFound_(rule, sheet)];
+
+  const sums = {};
+  const rowMap = {};
+
+  for (let r = headerRow + 1; r < rows.length; r++) {
+    const rawLabel = normalizeText_(rows[r][accountCol]);
+    if (!rawLabel) continue;
+
+    const normalizedAccount = normalizeAccountByRule_(rawLabel, ctx.normalizeRules) || rawLabel;
+    const amount = toNumber_(rows[r][amountCol]);
+    if (amount == null) continue;
+
+    sums[normalizedAccount] = (sums[normalizedAccount] || 0) + amount;
+    if (!rowMap[normalizedAccount]) rowMap[normalizedAccount] = r;
+  }
+
+  const results = [];
+  Object.keys(sums).sort().forEach(account => {
+    const decisionValue = ctx.decisionMap[account];
+    const a1 = toA1_(rowMap[account] + 1, amountCol + 1);
+    const jumpUrl = buildRangeUrl_(ctx.ss, sheet.getName(), a1);
+
+    if (decisionValue == null) {
+      results.push(makeResult_({
+        status: 'SKIP',
+        category: '内訳書',
+        ruleId: rule.rule_id,
+        sheetName: sheet.getName(),
+        itemName: account,
+        targetCell: a1,
+        jumpUrl: jumpUrl,
+        decisionValue: '',
+        compareValue: sums[account],
+        diff: '',
+        condition: '決算書科目なし',
+        message: '決算書に対象科目が無いためスキップ',
+        detail: '',
+      }));
+      return;
+    }
+
+    results.push(compareNumbersResult_(rule, sheet.getName(), account, decisionValue, sums[account], '内訳書', a1, jumpUrl));
+  });
+
+  if (results.length === 0) {
+    results.push(makeResult_({
+      status: '要確認',
+      category: '内訳書',
+      ruleId: rule.rule_id,
+      sheetName: sheet.getName(),
+      itemName: rule.document_type,
+      targetCell: '',
+      jumpUrl: '',
+      decisionValue: '',
+      compareValue: '',
+      diff: '',
+      condition: '比較対象なし',
+      message: '正規化後に比較対象科目が見つかりませんでした',
+      detail: '',
+    }));
+  }
+
+  return results;
+}
+
+/* =========================
+ * rules_kokyo
+ * ========================= */
+
+function runKokyoRules_(ss, ctx) {
+  const results = [];
+  const frontSheet = ss.getSheetByName(CONFIG.SHEET_KOKYO_FRONT);
+  const backSheet = ss.getSheetByName(CONFIG.SHEET_KOKYO_BACK);
+
+  const frontMap = frontSheet ? parseKeyValueSheet_(frontSheet) : {};
+  const backValues = backSheet ? getSheetValues_(backSheet).values : [];
+
+  for (const rule of ctx.rulesKokyo) {
+    if (!toBoolean_(rule.enabled)) continue;
+
+    try {
+      switch (rule.check_type) {
+        case 'NOT_BLANK': {
+          const value = frontMap[rule.item_name];
+          results.push(makeResult_({
+            status: isBlank_(value) ? (rule.severity || '要確認') : 'OK',
+            category: '概況書',
+            ruleId: rule.rule_id,
+            sheetName: CONFIG.SHEET_KOKYO_FRONT,
+            itemName: rule.item_name,
+            targetCell: '',
+            jumpUrl: '',
+            decisionValue: '',
+            compareValue: value || '',
+            diff: '',
+            condition: 'NOT_BLANK',
+            message: isBlank_(value) ? rule.message : 'OK',
+            detail: '',
+          }));
+          break;
+        }
+
+        case 'CONDITIONAL_NOT_BLANK': {
+          const condOk = evaluateConditionAgainstDecision_(rule.condition, ctx);
+          const value = frontMap[rule.item_name];
+          const bad = condOk && isBlank_(value);
+
+          results.push(makeResult_({
+            status: bad ? (rule.severity || '要確認') : 'OK',
+            category: '概況書',
+            ruleId: rule.rule_id,
+            sheetName: CONFIG.SHEET_KOKYO_FRONT,
+            itemName: rule.item_name,
+            targetCell: '',
+            jumpUrl: '',
+            decisionValue: '',
+            compareValue: value || '',
+            diff: '',
+            condition: rule.condition || '',
+            message: bad ? rule.message : 'OK',
+            detail: '',
+          }));
+          break;
+        }
+
+        case 'MATCH_DECISION': {
+          const frontValue = toNumber_(frontMap[rule.item_name]);
+          let decisionValue = resolveDecisionExpression_(rule.source_detail, ctx);
+
+          if (decisionValue != null) {
+            decisionValue = toKiloYenFloor_(decisionValue);
+          }
+
+          results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, decisionValue, frontValue, '概況書', '', ''));
+          break;
+        }
+
+        case 'MATCH_BREAKDOWN': {
+          results.push(makeResult_({
+            status: rule.severity || '要確認',
+            category: '概況書',
+            ruleId: rule.rule_id,
+            sheetName: CONFIG.SHEET_KOKYO_FRONT,
+            itemName: rule.item_name,
+            targetCell: '',
+            jumpUrl: '',
+            decisionValue: '',
+            compareValue: '',
+            diff: '',
+            condition: 'MATCH_BREAKDOWN',
+            message: rule.message,
+            detail: rule.source_detail || '',
+          }));
+          break;
+        }
+
+        case 'CALC_MATCH': {
+          if (!backSheet) {
+            results.push(makeResult_({
+              status: '要確認',
+              category: '概況書',
+              ruleId: rule.rule_id,
+              sheetName: '',
+              itemName: rule.item_name,
+              targetCell: '',
+              jumpUrl: '',
+              decisionValue: '',
+              compareValue: '',
+              diff: '',
+              condition: '概況書裏面未検出',
+              message: '概況書裏面シートが見つかりません',
+              detail: '',
+            }));
+            break;
+          }
+
+          const calcValue = evaluateCellExpression_(rule.source_detail, backValues);
+          let targetValue = null;
+
+          if (rule.rule_id === 'K100') {
+            targetValue = toNumber_(frontMap['売上_収入_高_千円']);
+          } else if (rule.rule_id === 'K101') {
+            targetValue = toNumber_(frontMap['売上_収入_原価_千円']);
+          } else if (rule.rule_id === 'K102') {
+            targetValue =
+              (toNumber_(frontMap['販管費のうち_役員報酬_千円']) || 0) +
+              (toNumber_(frontMap['販管費のうち_従業員給料_千円']) || 0);
+          }
+
+          results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_BACK, rule.item_name, targetValue, calcValue, '概況書', '', ''));
+          break;
+        }
+
+        default:
+          results.push(makeResult_({
+            status: '要確認',
+            category: '概況書',
+            ruleId: rule.rule_id,
+            sheetName: '',
+            itemName: rule.item_name,
+            targetCell: '',
+            jumpUrl: '',
+            decisionValue: '',
+            compareValue: '',
+            diff: '',
+            condition: rule.check_type,
+            message: `未対応のcheck_typeです: ${rule.check_type}`,
+            detail: '',
+          }));
+      }
+    } catch (err) {
+      results.push(makeResult_({
+        status: '要確認',
+        category: '概況書',
+        ruleId: rule.rule_id,
+        sheetName: '',
+        itemName: rule.item_name,
+        targetCell: '',
+        jumpUrl: '',
+        decisionValue: '',
+        compareValue: '',
+        diff: '',
+        condition: '実行エラー',
+        message: `概況書ルール実行中にエラー: ${err.message}`,
+        detail: err.stack || '',
+      }));
+    }
+  }
+
+  return results;
+}
+
+/* =========================
+ * 入力値全般チェック + Gemini
+ * ========================= */
+
+function runGlobalInputAnomalyChecks_(ss) {
+  const results = [];
+  const ignoreSheets = new Set([
+    CONFIG.SHEET_RULES_MAIN,
+    CONFIG.SHEET_RULES_KOKYO,
+    CONFIG.SHEET_GROUP_MASTER,
+    CONFIG.SHEET_NORMALIZE_MASTER,
+    CONFIG.SHEET_EXCLUDE_MASTER,
+    CONFIG.SHEET_RESULT,
+    CONFIG.SHEET_LOG,
+    CONFIG.SHEET_REPORT
+  ]);
+
+  const aiCache = {};
+
+  ss.getSheets().forEach(sheet => {
+    const name = sheet.getName();
+    if (ignoreSheets.has(name)) return;
+
+    const range = sheet.getDataRange();
+    const values = range.getDisplayValues();
+
+    for (let r = 0; r < values.length; r++) {
+      for (let c = 0; c < values[r].length; c++) {
+        const text = normalizeText_(values[r][c]);
+        if (!text) continue;
+        if (/^[0-9,\.\-△()\/年月日円千百]+$/.test(text)) continue;
+        if (text.length <= 1) continue;
+
+        const localReason = detectInputAnomalyReason_(text);
+        if (!localReason) continue;
+
+        let ai = aiCache[text];
+        if (!ai) {
+          ai = callGeminiCheckSafe_(text);
+          aiCache[text] = ai;
+          Utilities.sleep(200);
+        }
+
+        const a1 = toA1_(r + 1, c + 1);
+        const jumpUrl = buildRangeUrl_(ss, name, a1);
+
+        results.push(makeResult_({
+          status: '要確認',
+          category: '入力値チェック',
+          ruleId: 'AI001',
+          sheetName: name,
+          itemName: `${a1}: ${text}`,
+          targetCell: a1,
+          jumpUrl: jumpUrl,
+          decisionValue: '',
+          compareValue: text,
+          diff: '',
+          condition: 'GLOBAL_TEXT_CHECK',
+          message: localReason,
+          detail: '',
+          aiJudge: ai ? (ai.is_suspicious ? '不自然' : '要確認') : '未判定',
+          aiReason: ai ? (ai.reason || '') : '',
+          aiSuggestion1: ai && ai.suggestions && ai.suggestions[0] ? ai.suggestions[0] : '',
+          aiSuggestion2: ai && ai.suggestions && ai.suggestions[1] ? ai.suggestions[1] : '',
+        }));
+      }
+    }
+  });
+
+  return results;
+}
+
+function detectInputAnomalyReason_(text) {
+  if (/[�]/.test(text)) return '文字化けの可能性があります';
+  if (/(Ã|â|œ|‰)/.test(text)) return '文字コード崩れの可能性があります';
+  if (/\?\?+/.test(text)) return '文字化けの可能性があります';
+  if (/[\u0000-\u001F\u007F]/.test(text)) return '制御文字が含まれています';
+
+  if (/([一-龠々ヶァ-ヴーぁ-ん])\1/.test(text)) {
+    if (!/(佐々木|久々|代々|堂々|人々|様々)/.test(text)) {
+      return '同じ文字の不自然な重複の可能性があります';
+    }
+  }
+
+  if (/([一-龠ぁ-んァ-ヴー]{2,})\1/.test(text)) {
+    return '語の重複入力の可能性があります';
+  }
+
+  const hasHalfKana = /[｡-ﾟ]/.test(text);
+  const hasFullKana = /[ァ-ヴ]/.test(text);
+  const hasAlpha = /[A-Za-z]/.test(text);
+  const hasJapanese = /[一-龠ぁ-んァ-ヴ]/.test(text);
+
+  if ((hasHalfKana && hasFullKana) || (hasAlpha && hasJapanese && /\s/.test(text))) {
+    return '文字種の混在が不自然です';
+  }
 
   return '';
 }
 
-/** =========================
- * 決算書PDF解析
- * ========================= */
+function getGeminiApiKey_() {
+  return PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+}
 
-function extractBsMapFromPdf_(folder, pdfInfo, logs) {
-  let tempDocId = '';
+function callGeminiCheckSafe_(text) {
   try {
-    const file = DriveApp.getFileById(pdfInfo.fileId);
-    const blob = file.getBlob();
-
-    const resource = {
-      name: '[TEMP_PDFDOC]_' + pdfInfo.fileName + '_' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyyMMdd_HHmmss'),
-      mimeType: MimeType.GOOGLE_DOCS,
-      parents: [folder.getId()],
+    return callGeminiCheck_(text);
+  } catch (e) {
+    return {
+      is_suspicious: true,
+      reason: `Gemini判定失敗: ${e.message}`,
+      suggestions: []
     };
-
-    const converted = Drive.Files.create(resource, blob, {
-      supportsAllDrives: true,
-    });
-
-    tempDocId = converted.id;
-
-    const text = DocumentApp.openById(tempDocId).getBody().getText();
-    const bsMap = parseBsAmountsFromText_(text);
-
-    log_(logs, 'INFO', '決算書PDF解析完了: ' + pdfInfo.fileName + ' / 科目数=' + Object.keys(bsMap).length);
-    return bsMap;
-
-  } finally {
-    if (tempDocId && CONFIG.DELETE_TEMP_CONVERTED_DOCS) {
-      try {
-        DriveApp.getFileById(tempDocId).setTrashed(true);
-      } catch (e) {}
-    }
   }
 }
 
-function parseBsAmountsFromText_(text) {
+function callGeminiCheck_(text) {
+  const apiKey = getGeminiApiKey_();
+  if (!apiKey) {
+    return {
+      is_suspicious: true,
+      reason: 'GEMINI_API_KEY が未設定です',
+      suggestions: []
+    };
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+
+  const prompt = `
+あなたは税務書類の入力値チェック支援AIです。
+次の文字列が日本語として不自然か、誤入力・重複入力・文字化け・綴り違いの可能性があるか判定してください。
+固有名詞の可能性もあるため、断定しすぎず要確認ベースで判断してください。
+不自然な場合は修正候補を最大2件返してください。
+
+入力文字列: ${text}
+
+必ずJSONだけで返してください。
+{
+  "is_suspicious": true,
+  "reason": "不自然な理由",
+  "suggestions": ["候補1", "候補2"]
+}
+`.trim();
+
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.1,
+      responseMimeType: "application/json"
+    }
+  };
+
+  const res = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const code = res.getResponseCode();
+  const body = res.getContentText();
+
+  if (code < 200 || code >= 300) {
+    throw new Error(`Gemini API error ${code}: ${body}`);
+  }
+
+  const json = JSON.parse(body);
+  const textOut = json.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!textOut) throw new Error('Gemini応答が空です');
+
+  const parsed = JSON.parse(textOut);
+
+  return {
+    is_suspicious: !!parsed.is_suspicious,
+    reason: parsed.reason || '',
+    suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions.slice(0, 2) : []
+  };
+}
+
+/* =========================
+ * report_A4
+ * ========================= */
+
+function buildA4Report_(ss) {
+  const src = getRequiredSheet_(ss, CONFIG.SHEET_RESULT);
+  const values = src.getDataRange().getValues();
+  if (values.length < 2) return;
+
+  const header = values[0];
+  const rows = values.slice(1);
+
+  let report = ss.getSheetByName(CONFIG.SHEET_REPORT);
+  if (report) ss.deleteSheet(report);
+  report = ss.insertSheet(CONFIG.SHEET_REPORT);
+
+  const colIndex = {};
+  header.forEach((h, i) => colIndex[h] = i);
+
+  const picked = rows.filter(r => {
+    const status = String(r[colIndex['判定']] || '');
+    return status !== 'OK';
+  });
+
+  const out = [[
+    '判定',
+    '区分',
+    '対象シート',
+    '対象項目',
+    '対象セル',
+    'メッセージ',
+    '比較値',
+    '決算書値',
+    '差額',
+    'AI理由',
+    'ジャンプ'
+  ]];
+
+  picked.forEach(r => {
+    out.push([
+      r[colIndex['判定']],
+      r[colIndex['区分']],
+      r[colIndex['対象シート']],
+      r[colIndex['対象項目']],
+      r[colIndex['対象セル']],
+      r[colIndex['メッセージ']],
+      r[colIndex['比較値']],
+      r[colIndex['決算書値']],
+      r[colIndex['差額']],
+      r[colIndex['AI理由']],
+      r[colIndex['ジャンプURL']] ? '開く' : ''
+    ]);
+  });
+
+  report.getRange(1, 1, out.length, out[0].length).setValues(out);
+
+  for (let i = 2; i <= out.length; i++) {
+    const srcRow = picked[i - 2];
+    const jumpUrl = srcRow[colIndex['ジャンプURL']];
+    if (jumpUrl) {
+      const rich = SpreadsheetApp.newRichTextValue()
+        .setText('開く')
+        .setLinkUrl(jumpUrl)
+        .build();
+      report.getRange(i, 11).setRichTextValue(rich);
+    }
+  }
+
+  report.getRange(1, 1, 1, 11).setFontWeight('bold').setBackground('#d9ead3');
+  report.setFrozenRows(1);
+  report.setColumnWidths(1, 11, 120);
+  report.setColumnWidth(4, 240);
+  report.setColumnWidth(6, 320);
+  report.setColumnWidth(10, 240);
+  report.setColumnWidth(11, 80);
+
+  if (report.getFilter()) report.getFilter().remove();
+  report.getDataRange().createFilter();
+  report.hideGridlines(true);
+}
+
+/* =========================
+ * 決算書解析
+ * ========================= */
+
+function parseDecisionSheet_(sheet) {
+  const { values } = getSheetValues_(sheet);
   const map = {};
-  const lines = String(text || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
 
-  let inBs = false;
-  for (const line of lines) {
-    if (line.indexOf('貸借対照表') >= 0) {
-      inBs = true;
-      continue;
+  let section = '';
+  for (let r = 0; r < values.length; r++) {
+    const colA = normalizeText_(values[r][0]);
+    const colB = values[r][1];
+    const colD = values[r][3];
+
+    const key = colA;
+    const amount = toNumber_(colB) != null ? toNumber_(colB) : toNumber_(colD);
+
+    if (!key) continue;
+
+    if (key.includes('資産の部') || key.includes('負債の部') || key.includes('純資産の部')) {
+      section = key;
     }
-    if (inBs && line.indexOf('損益計算書') >= 0) {
-      break;
+
+    if (amount != null) {
+      map[key] = amount;
     }
-    if (!inBs) continue;
 
-    const m = line.match(/^(.+?)\s+([△\-]?\s*[\d,]+)$/);
-    if (!m) continue;
-
-    const account = normalizeAccountName_(m[1]);
-    const amount = parseAmount_(m[2]);
-
-    if (!account || amount === null) continue;
-    if (isIgnoredBsAccount_(account)) continue;
-
-    map[account] = amount;
+    if (section && amount != null && key && !key.includes('の部')) {
+      map[`${section}:${key}`] = amount;
+    }
   }
 
   return map;
 }
 
-function isIgnoredBsAccount_(account) {
-  const ng = [
-    '資産の部',
-    '負債の部',
-    '純資産の部',
-    '流動資産',
-    '固定資産',
-    '流動負債',
-    '固定負債',
-    '株主資本',
-    '利益剰余金',
-    'その他利益剰余金',
-    '繰越利益剰余金',
-    '資産の部合計',
-    '負債の部合計',
-    '純資産の部合計',
-    '負債・純資産の部合計',
-  ];
-  return ng.indexOf(account) >= 0;
-}
-
-function normalizeAccountName_(name) {
-  return String(name || '')
-    .replace(/[【】\[\]]/g, '')
-    .replace(/\s+/g, '')
-    .replace('現金預金', '現金及び預金')
-    .replace('棚卸資産', '仕掛品')
-    .trim();
-}
-
-/** =========================
- * 突合
+/* =========================
+ * ルール・マスタ読込
  * ========================= */
 
-function compareBsVsExcel_(bsMap, excelMap) {
-  const rows = [];
-  const keys = Object.keys(bsMap || {}).sort();
-
-  keys.forEach(account => {
-    const bsAmount = bsMap[account];
-    const excelAmount = findExcelAmountByAccount_(excelMap, account);
-
-    let result = '';
-    let comment = '';
-
-    if (excelAmount === null) {
-      result = 'NG';
-      comment = 'Excel側に対応する勘定科目が見つかりません';
-    } else if (bsAmount === excelAmount) {
-      result = 'OK';
-      comment = '一致';
-    } else {
-      result = 'NG';
-      comment = '残高不一致';
-    }
-
-    rows.push({
-      account,
-      bsAmount,
-      excelAmount,
-      diff: excelAmount === null ? '' : bsAmount - excelAmount,
-      result,
-      comment,
-    });
-  });
-
-  return rows;
+function loadRulesMain_(ss) {
+  return loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_RULES_MAIN));
 }
 
-function findExcelAmountByAccount_(excelMap, account) {
-  if (Object.prototype.hasOwnProperty.call(excelMap, account)) return excelMap[account];
+function loadRulesKokyo_(ss) {
+  return loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_RULES_KOKYO));
+}
 
-  const aliasMap = {
-    '現金及び預金': ['預貯金'],
-    '長期借入金': ['借入金'],
-    '役員借入金': ['役員借入金'],
-    '仕掛品': ['仕掛品', '棚卸資産'],
-    '前払費用': ['前払費用'],
-    '敷金': ['敷金'],
-    '保険積立金': ['保険積立金'],
-    '買掛金': ['買掛金'],
-    '未払金': ['未払金'],
-    '未払費用': ['未払費用'],
-    '預り金': ['預り金'],
-    '売掛金': ['売掛金'],
-    '受取手形': ['受取手形'],
-    '仮払金': ['仮払金'],
-    '貸付金': ['貸付金'],
-  };
+function loadGroupMaster_(ss) {
+  const rows = loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_GROUP_MASTER));
+  const map = {};
+  rows.forEach(r => {
+    const g = normalizeText_(r.group_name);
+    const a = normalizeText_(r.account_name);
+    if (!g || !a) return;
+    if (!map[g]) map[g] = [];
+    map[g].push(a);
+  });
+  return map;
+}
 
-  const aliases = aliasMap[account] || [];
-  for (const a of aliases) {
-    if (Object.prototype.hasOwnProperty.call(excelMap, a)) return excelMap[a];
+function loadNormalizeMaster_(ss) {
+  return loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_NORMALIZE_MASTER))
+    .map(r => ({
+      keyword: normalizeText_(r.keyword),
+      normalized: normalizeText_(r.normalized),
+    }))
+    .filter(r => r.keyword && r.normalized);
+}
+
+function loadExcludeMaster_(ss) {
+  const rows = loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_EXCLUDE_MASTER));
+  const set = new Set();
+  rows.forEach(r => {
+    const name = normalizeText_(r.account_name);
+    if (name) set.add(name);
+  });
+  return set;
+}
+
+/* =========================
+ * 決算書値解決
+ * ========================= */
+
+function resolveDecisionTargetValue_(rule, ctx) {
+  if (normalizeText_(rule.target_account)) {
+    return resolveDecisionExpression_(rule.target_account, ctx);
   }
-
+  if (normalizeText_(rule.target_account_group)) {
+    const groupName = normalizeText_(rule.target_account_group);
+    const accounts = ctx.groups[groupName] || [];
+    const filtered = accounts.filter(a => ctx.decisionMap[a] != null);
+    if (filtered.length === 0) return null;
+    return filtered.reduce((sum, a) => sum + (ctx.decisionMap[a] || 0), 0);
+  }
   return null;
 }
 
-/** =========================
- * 結果出力
+function resolveDecisionExpression_(expr, ctx) {
+  const text = normalizeText_(expr);
+  if (!text) return null;
+
+  const parts = text.split('+').map(s => normalizeText_(s)).filter(Boolean);
+  if (parts.length === 0) return null;
+
+  let foundAny = false;
+  const total = parts.reduce((sum, part) => {
+    if (ctx.groups[part]) {
+      const groupAccounts = ctx.groups[part].filter(acc => ctx.decisionMap[acc] != null);
+      if (groupAccounts.length === 0) return sum;
+      foundAny = true;
+      return sum + groupAccounts.reduce((s, acc) => s + (ctx.decisionMap[acc] || 0), 0);
+    }
+
+    if (ctx.decisionMap[part] != null) {
+      foundAny = true;
+      return sum + (ctx.decisionMap[part] || 0);
+    }
+
+    return sum;
+  }, 0);
+
+  return foundAny ? total : null;
+}
+
+function toKiloYenFloor_(value) {
+  if (value === null || value === '' || isNaN(value)) return null;
+  return Math.floor(Number(value) / 1000);
+}
+
+/* =========================
+ * 汎用
  * ========================= */
 
-function createResultSpreadsheet_(params) {
-  const folder = params.folder;
-  const folderId = params.folderId;
-  const scanned = params.scanned;
-  const selectedPdf = params.selectedPdf;
-  const excelAnalysis = params.excelAnalysis || [];
-  const excelBalance = params.excelBalance || { accountMap: {}, detailRows: [] };
-  const bsMap = params.bsMap || {};
-  const comparisonRows = params.comparisonRows || [];
-  const startedAt = params.startedAt;
-  const logs = params.logs || [];
+function loadRowsAsObjects_(sheet) {
+  const { displayValues } = getSheetValues_(sheet);
+  if (displayValues.length < 2) return [];
 
-  const timestamp = Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyyMMdd_HHmmss');
-  const name = CONFIG.RESULT_FILE_PREFIX + '_' + timestamp;
-  const ss = SpreadsheetApp.create(name);
-
-  const ssFile = DriveApp.getFileById(ss.getId());
-  folder.addFile(ssFile);
-  try {
-    DriveApp.getRootFolder().removeFile(ssFile);
-  } catch (e) {}
-
-  const firstSheet = ss.getSheets()[0];
-  firstSheet.setName(CONFIG.SHEET_NAMES.summary);
-
-  const filesSheet = ss.insertSheet(CONFIG.SHEET_NAMES.files);
-  const excelCheckSheet = ss.insertSheet(CONFIG.SHEET_NAMES.excelCheck);
-  const adoptedSheet = ss.insertSheet(CONFIG.SHEET_NAMES.adopted);
-  const excelBalanceSheet = ss.insertSheet(CONFIG.SHEET_NAMES.excelBalance);
-  const bsSheet = ss.insertSheet(CONFIG.SHEET_NAMES.bs);
-  const compareSheet = ss.insertSheet(CONFIG.SHEET_NAMES.compare);
-  const logSheet = ss.insertSheet(CONFIG.SHEET_NAMES.log);
-
-  writeSummarySheet_(firstSheet, {
-    folder,
-    folderId,
-    scanned,
-    selectedPdf,
-    excelAnalysis,
-    startedAt,
-    comparisonRows,
-  });
-
-  writeFilesSheet_(filesSheet, scanned.allFiles || []);
-  writeExcelCheckSheet_(excelCheckSheet, excelAnalysis);
-  writeAdoptedSheet_(adoptedSheet, selectedPdf, excelAnalysis);
-  writeExcelBalanceSheet_(excelBalanceSheet, excelBalance.accountMap);
-  writeBsSheet_(bsSheet, bsMap);
-  writeCompareSheet_(compareSheet, comparisonRows);
-  writeLogSheet_(logSheet, logs);
-
-  return ss;
-}
-
-function writeSummarySheet_(sh, data) {
-  sh.clearContents();
-
-  const adoptedExcel = (data.excelAnalysis || []).filter(x => x.isTarget);
-  const skippedExcel = (data.excelAnalysis || []).filter(x => !x.isTarget);
-  const ngCount = (data.comparisonRows || []).filter(x => x.result === 'NG').length;
-  const okCount = (data.comparisonRows || []).filter(x => x.result === 'OK').length;
-
-  const rows = [
-    ['項目', '値'],
-    ['GAS版', APP_VERSION],
-    ['実行開始', data.startedAt],
-    ['実行時刻', new Date()],
-    ['フォルダ名', data.folder.getName()],
-    ['フォルダID', data.folderId],
-    ['全ファイル数', (data.scanned.allFiles || []).length],
-    ['PDF件数', (data.scanned.pdfFiles || []).length],
-    ['Excel件数', (data.scanned.excelFiles || []).length],
-    ['採用PDF', data.selectedPdf ? data.selectedPdf.fileName : ''],
-    ['採用Excel件数', adoptedExcel.length],
-    ['除外Excel件数', skippedExcel.length],
-    ['突合OK件数', okCount],
-    ['突合NG件数', ngCount],
-  ];
-
-  sh.getRange(1, 1, rows.length, 2).setValues(rows);
-  sh.setFrozenRows(1);
-  sh.autoResizeColumns(1, 2);
-  sh.getRange(1, 1, sh.getLastRow(), 2).setWrap(true);
-}
-
-function writeFilesSheet_(sh, files) {
-  sh.clearContents();
-
-  const headers = ['No', 'fileId', 'fileName', 'mimeType', 'size', 'updatedAt', 'url'];
-  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-
-  const rows = (files || []).map((f, i) => [
-    i + 1,
-    f.fileId || '',
-    f.fileName || '',
-    f.mimeType || '',
-    f.size || '',
-    f.updatedAt || '',
-    f.url || '',
-  ]);
-
-  if (rows.length) {
-    sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
-  }
-
-  sh.setFrozenRows(1);
-  sh.autoResizeColumns(1, headers.length);
-  sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), headers.length).setWrap(true);
-}
-
-function writeExcelCheckSheet_(sh, excelAnalysis) {
-  sh.clearContents();
-
-  const headers = [
-    'No',
-    'fileId',
-    'fileName',
-    '判定結果',
-    '確認シート数',
-    '5行目以降にデータあり',
-    'データありシート名',
-    'エラー',
-    '元ファイルURL',
-    '一時変換Sheet URL'
-  ];
-  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-
-  const rows = (excelAnalysis || []).map((x, i) => [
-    i + 1,
-    x.fileId || '',
-    x.fileName || '',
-    x.statusJa || '',
-    x.checkedSheetCount || 0,
-    x.hasDataAfterRow5 ? 'あり' : 'なし',
-    (x.nonEmptySheetNames || []).join('\n'),
-    x.error || '',
-    x.url || '',
-    x.tempSpreadsheetUrl || '',
-  ]);
-
-  if (rows.length) {
-    sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
-  }
-
-  sh.setFrozenRows(1);
-  sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), headers.length).setWrap(true);
-
-  if (sh.getLastRow() >= 2) {
-    const range = sh.getRange(2, 4, sh.getLastRow() - 1, 1);
-    const values = range.getValues();
-    const bg = values.map(([v]) => {
-      if (v === 'OK（使用）') return ['#d9ead3'];
-      if (v === '空欄（oldへ移動）') return ['#fce5cd'];
-      if (v === '判定失敗') return ['#f4cccc'];
-      return ['#ffffff'];
-    });
-    range.setBackgrounds(bg);
-  }
-}
-
-function writeAdoptedSheet_(sh, selectedPdf, excelAnalysis) {
-  sh.clearContents();
-
-  const headers = ['区分', 'fileName', 'fileId', 'url', '備考'];
-  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-
+  const headers = displayValues[0].map(h => normalizeText_(h));
   const rows = [];
 
-  rows.push([
-    '決算書PDF',
-    selectedPdf ? selectedPdf.fileName : '',
-    selectedPdf ? selectedPdf.fileId : '',
-    selectedPdf ? selectedPdf.url : '',
-    selectedPdf ? '採用' : '未検出'
-  ]);
+  for (let r = 1; r < displayValues.length; r++) {
+    const row = displayValues[r];
+    if (row.join('').trim() === '') continue;
 
-  (excelAnalysis || []).filter(x => x.isTarget).forEach(x => {
-    rows.push([
-      'Excel',
-      x.fileName || '',
-      x.fileId || '',
-      x.url || '',
-      '採用'
-    ]);
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = row[i]);
+    rows.push(obj);
+  }
+  return rows;
+}
+
+function getSheetValues_(sheet) {
+  const range = sheet.getDataRange();
+  return {
+    values: range.getValues(),
+    displayValues: range.getDisplayValues(),
+  };
+}
+
+function getRequiredSheet_(ss, name) {
+  const sh = ss.getSheetByName(name);
+  if (!sh) throw new Error(`シートがありません: ${name}`);
+  return sh;
+}
+
+function ensureSheetInSpreadsheet_(ss, name) {
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+function findTargetSheetByPattern_(ss, pattern) {
+  const p = normalizeText_(pattern);
+  if (!p) return null;
+
+  const sheets = ss.getSheets();
+  for (const sh of sheets) {
+    if (normalizeText_(sh.getName()).includes(p)) return sh;
+  }
+  return null;
+}
+
+function parseKeyValueSheet_(sheet) {
+  const { displayValues } = getSheetValues_(sheet);
+  const map = {};
+
+  for (let r = 0; r < displayValues.length; r++) {
+    const key = normalizeText_(displayValues[r][0]);
+    const value = displayValues[r][1];
+    if (!key) continue;
+    map[key] = value;
+  }
+  return map;
+}
+
+function evaluateConditionAgainstDecision_(condition, ctx) {
+  const text = normalizeText_(condition);
+  if (!text) return false;
+
+  const m = text.match(/^(.+?)>0$/);
+  if (!m) return false;
+
+  const expr = normalizeText_(m[1]);
+  const value = resolveDecisionExpression_(expr, ctx);
+  return (value || 0) > 0;
+}
+
+function evaluateCellExpression_(expr, values) {
+  const text = normalizeText_(expr);
+  if (!text) return null;
+
+  const parts = text.split('+').map(s => normalizeText_(s)).filter(Boolean);
+  return parts.reduce((sum, ref) => sum + (getCellByA1_(values, ref) || 0), 0);
+}
+
+function getCellByA1_(values, a1) {
+  const m = String(a1).match(/^([A-Z]+)(\d+)$/i);
+  if (!m) return 0;
+  const col = colToIndex_(m[1]);
+  const row = Number(m[2]) - 1;
+  if (row < 0 || row >= values.length) return 0;
+  if (col < 0 || col >= values[row].length) return 0;
+  return toNumber_(values[row][col]) || 0;
+}
+
+function colToIndex_(col) {
+  const s = String(col || '').trim().toUpperCase();
+  if (!s) return -1;
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    n = n * 26 + (s.charCodeAt(i) - 64);
+  }
+  return n - 1;
+}
+
+function findHeaderRowByText_(rows, text, colIndex) {
+  const target = normalizeText_(text);
+  if (!target || colIndex < 0) return -1;
+
+  for (let r = 0; r < rows.length; r++) {
+    const cell = rows[r][colIndex];
+    if (normalizeText_(cell) === target) return r;
+  }
+  return -1;
+}
+
+function sumColumnBelowHeader_(rows, headerRow, colIndex) {
+  let sum = 0;
+  for (let r = headerRow + 1; r < rows.length; r++) {
+    const n = toNumber_(rows[r][colIndex]);
+    if (n != null) sum += n;
+  }
+  return sum;
+}
+
+function findCellByText_(displayValues, text) {
+  const target = normalizeText_(text);
+  for (let r = 0; r < displayValues.length; r++) {
+    for (let c = 0; c < displayValues[r].length; c++) {
+      if (normalizeText_(displayValues[r][c]) === target) {
+        return { row: r, col: c };
+      }
+    }
+  }
+  return null;
+}
+
+function findRightNumericValue_(displayValues, row, col) {
+  for (let c = col + 1; c < Math.min(displayValues[row].length, col + 8); c++) {
+    const n = toNumber_(displayValues[row][c]);
+    if (n != null) return n;
+  }
+  return null;
+}
+
+function findRightTextValue_(displayValues, row, col) {
+  for (let c = col + 1; c < Math.min(displayValues[row].length, col + 8); c++) {
+    const v = normalizeText_(displayValues[row][c]);
+    if (v) return v;
+  }
+  return '';
+}
+
+function normalizeAccountByRule_(text, normalizeRules) {
+  const t = normalizeText_(text);
+  for (const rule of normalizeRules) {
+    if (t.includes(rule.keyword)) return rule.normalized;
+  }
+  return '';
+}
+
+function mergeExcludeAccounts_(ruleExclude, masterSet) {
+  const set = new Set(masterSet ? [...masterSet] : []);
+  normalizeText_(ruleExclude).split('|').map(s => s.trim()).filter(Boolean).forEach(v => set.add(v));
+  return set;
+}
+
+function compareNumbersResult_(rule, sheetName, itemName, decisionValue, compareValue, category, targetCell, jumpUrl) {
+  const d = toNumber_(decisionValue);
+  const c = toNumber_(compareValue);
+
+  if (d == null) {
+    return makeResult_({
+      status: 'SKIP',
+      category: category || '内訳書',
+      ruleId: rule.rule_id,
+      sheetName,
+      itemName,
+      targetCell: targetCell || '',
+      jumpUrl: jumpUrl || '',
+      decisionValue: '',
+      compareValue: c ?? '',
+      diff: '',
+      condition: '決算書科目なし',
+      message: '決算書に対象科目が無いためスキップ',
+      detail: '',
+    });
+  }
+
+  const diff = (c == null) ? '' : c - d;
+  const ok = (c != null && Math.round(d) === Math.round(c));
+
+  return makeResult_({
+    status: ok ? 'OK' : (rule.severity || 'NG'),
+    category: category || '内訳書',
+    ruleId: rule.rule_id,
+    sheetName,
+    itemName,
+    targetCell: targetCell || '',
+    jumpUrl: jumpUrl || '',
+    decisionValue: d,
+    compareValue: c,
+    diff,
+    condition: rule.check_type || '',
+    message: ok ? 'OK' : rule.message,
+    detail: '',
   });
-
-  if (rows.length) {
-    sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
-  }
-
-  sh.setFrozenRows(1);
-  sh.autoResizeColumns(1, headers.length);
-  sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), headers.length).setWrap(true);
 }
 
-function writeExcelBalanceSheet_(sh, accountMap) {
-  sh.clearContents();
-  const headers = ['勘定科目', 'Excel集計残高'];
-  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-
-  const keys = Object.keys(accountMap || {}).sort();
-  const rows = keys.map(k => [k, accountMap[k]]);
-
-  if (rows.length) {
-    sh.getRange(2, 1, rows.length, 2).setValues(rows);
-  }
-
-  sh.setFrozenRows(1);
-  sh.autoResizeColumns(1, 2);
-}
-
-function writeBsSheet_(sh, bsMap) {
-  sh.clearContents();
-  const headers = ['勘定科目', '決算書残高'];
-  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-
-  const keys = Object.keys(bsMap || {}).sort();
-  const rows = keys.map(k => [k, bsMap[k]]);
-
-  if (rows.length) {
-    sh.getRange(2, 1, rows.length, 2).setValues(rows);
-  }
-
-  sh.setFrozenRows(1);
-  sh.autoResizeColumns(1, 2);
-}
-
-function writeCompareSheet_(sh, rowsData) {
-  sh.clearContents();
-  const headers = ['勘定科目', '決算書残高', 'Excel集計残高', '差額', '判定', 'コメント'];
-  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-
-  const rows = (rowsData || []).map(r => [
-    r.account || '',
-    r.bsAmount || '',
-    r.excelAmount === null ? '' : r.excelAmount,
-    r.diff === '' ? '' : r.diff,
-    r.result || '',
-    r.comment || '',
-  ]);
-
-  if (rows.length) {
-    sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
-  }
-
-  sh.setFrozenRows(1);
-  sh.autoResizeColumns(1, headers.length);
-  sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), headers.length).setWrap(true);
-
-  if (sh.getLastRow() >= 2) {
-    const range = sh.getRange(2, 5, sh.getLastRow() - 1, 1);
-    const values = range.getValues();
-    const bg = values.map(([v]) => [v === 'OK' ? '#d9ead3' : '#f4cccc']);
-    range.setBackgrounds(bg);
-  }
-}
-
-function writeLogSheet_(sh, logs) {
-  sh.clearContents();
-
-  const headers = ['時刻', '区分', '内容'];
-  sh.getRange(1, 1, 1, 3).setValues([headers]);
-
-  const rows = (logs || []).map(l => [l.at, l.level, l.message]);
-  if (rows.length) {
-    sh.getRange(2, 1, rows.length, 3).setValues(rows);
-  }
-
-  sh.setFrozenRows(1);
-  sh.autoResizeColumns(1, 3);
-  sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 3).setWrap(true);
-}
-
-/** =========================
- * 補助
- * ========================= */
-
-function log_(logs, level, message) {
-  logs.push({
-    at: new Date(),
-    level,
-    message,
+function ngHeaderNotFound_(rule, sheet) {
+  return makeResult_({
+    status: rule.severity || 'NG',
+    category: '内訳書',
+    ruleId: rule.rule_id,
+    sheetName: sheet.getName(),
+    itemName: rule.header_name,
+    targetCell: '',
+    jumpUrl: '',
+    decisionValue: '',
+    compareValue: '',
+    diff: '',
+    condition: 'ヘッダー未検出',
+    message: `${rule.header_name} が見つかりません`,
+    detail: '',
   });
 }
 
-function escapeHtml_(s) {
-  return String(s || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+function buildRangeUrl_(ss, sheetName, a1) {
+  const sh = ss.getSheetByName(sheetName);
+  if (!sh || !a1) return '';
+  return `${ss.getUrl()}#gid=${sh.getSheetId()}&range=${encodeURIComponent(a1)}`;
 }
 
-function renderHtmlResult_(result) {
+function toA1_(row, col) {
+  let s = '';
+  while (col > 0) {
+    const m = (col - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    col = Math.floor((col - 1) / 26);
+  }
+  return `${s}${row}`;
+}
+
+function makeResult_(obj) {
   return [
-    '<h3>決算書Excelチェック起動完了</h3>',
-    '<p>フォルダ名: ' + escapeHtml_(result.folderName || '') + '</p>',
-    '<p>PDF件数: ' + escapeHtml_(String(result.pdfCount || 0)) + '</p>',
-    '<p>Excel件数: ' + escapeHtml_(String(result.excelCount || 0)) + '</p>',
-    '<p>採用Excel件数: ' + escapeHtml_(String(result.adoptedExcelCount || 0)) + '</p>',
-    '<p>除外Excel件数: ' + escapeHtml_(String(result.skippedExcelCount || 0)) + '</p>',
-    '<p>採用PDF: ' + escapeHtml_(result.selectedPdfName || '') + '</p>',
-    '<p><a href="' + result.resultSpreadsheetUrl + '" target="_blank">結果スプレッドシートを開く</a></p>',
-  ].join('');
+    obj.status || '',
+    obj.category || '',
+    obj.ruleId || '',
+    obj.sheetName || '',
+    obj.itemName || '',
+    obj.targetCell || '',
+    obj.jumpUrl || '',
+    obj.decisionValue ?? '',
+    obj.compareValue ?? '',
+    obj.diff ?? '',
+    obj.condition || '',
+    obj.message || '',
+    obj.detail || '',
+    obj.aiJudge || '',
+    obj.aiReason || '',
+    obj.aiSuggestion1 || '',
+    obj.aiSuggestion2 || '',
+    new Date(),
+  ];
+}
+
+function writeResults_(ss, rows) {
+  const sh = getRequiredSheet_(ss, CONFIG.SHEET_RESULT);
+  if (!rows.length) return;
+  sh.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function appendLogRow_(ss, message) {
+  const sh = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_LOG);
+  sh.appendRow([new Date(), message]);
+}
+
+function getNowStr_() {
+  return Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd_HHmmss');
+}
+
+function normalizeText_(v) {
+  return String(v == null ? '' : v).replace(/\s+/g, '').trim();
+}
+
+function isBlank_(v) {
+  return normalizeText_(v) === '';
+}
+
+function toBoolean_(v) {
+  const s = String(v == null ? '' : v).toUpperCase();
+  return s === 'TRUE' || s === '1' || s === 'YES';
+}
+
+function toNumber_(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return v;
+
+  let s = String(v).trim();
+  if (!s) return null;
+
+  s = s
+    .replace(/,/g, '')
+    .replace(/△/g, '-')
+    .replace(/[()]/g, '')
+    .replace(/円/g, '');
+
+  if (!s || s === '-') return null;
+
+  const n = Number(s);
+  return isNaN(n) ? null : n;
+}
+
+function isSectionLike_(text) {
+  const t = normalizeText_(text);
+  return (
+    t.startsWith('【') ||
+    t.includes('合計') ||
+    t.includes('計') ||
+    t.includes('の部')
+  );
 }
