@@ -990,8 +990,8 @@ function checkNormalizeSum_(rule, sheet, rows, ctx) {
 
 function runKokyoRules_(ss, ctx) {
   const results = [];
-  const frontSheet = findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_FRONT);
-  const backSheet = findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_BACK);
+  const frontSheet = findKokyoFrontSheet_(ss);
+  const backSheet = findKokyoBackSheet_(ss);
 
   const frontMap = frontSheet ? parseKeyValueSheet_(frontSheet) : {};
   const backValues = backSheet ? getSheetValues_(backSheet).values : [];
@@ -1046,6 +1046,15 @@ function runKokyoRules_(ss, ctx) {
         }
 
         case 'MATCH_DECISION': {
+          const sourceType = normalizeText_(rule.source_type || rule.document_type);
+          const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
+          if (sourceType.includes('内訳書') && hasLookupConfig) {
+            const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
+            const lookupValue = resolveBreakdownLookupValue_(ss, rule);
+            results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
+            break;
+          }
+
           const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
           let decisionValue = resolveDecisionExprWithPickRule_(
             rule.source_detail,
@@ -1064,6 +1073,15 @@ function runKokyoRules_(ss, ctx) {
         }
 
         case 'MATCH_DECISION_EXPR': {
+          const sourceType = normalizeText_(rule.source_type || rule.document_type);
+          const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
+          if (sourceType.includes('内訳書') && hasLookupConfig) {
+            const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
+            const lookupValue = resolveBreakdownLookupValue_(ss, rule);
+            results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
+            break;
+          }
+
           const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
           let decisionValue = resolveDecisionExprWithPickRule_(
             rule.source_detail,
@@ -1226,7 +1244,10 @@ function resolveBreakdownLookupValue_(ss, rule) {
   if (!targetSheet) return null;
 
   const values = targetSheet.getDataRange().getDisplayValues();
-  const matchCol = colToIndex_(rule.lookup_match_col);
+  let matchCol = colToIndex_(rule.lookup_match_col);
+  if (matchCol < 0) {
+    matchCol = a1ColToIndex_(rule.lookup_name_cell);
+  }
   const matchMode = rule.account_match_mode || 'contains';
 
   if (matchCol < 0) return null;
@@ -1241,6 +1262,12 @@ function resolveBreakdownLookupValue_(ss, rule) {
   }
 
   return null;
+}
+
+function a1ColToIndex_(a1) {
+  const m = String(a1 || '').trim().match(/^([A-Z]+)\d+$/i);
+  if (!m) return -1;
+  return colToIndex_(m[1]);
 }
 
 function isMatchByMode_(cellText, targetText, mode) {
@@ -2154,6 +2181,25 @@ function findSheetByFlexibleName_(ss, baseName) {
     if (name.includes(target)) return sh;
   }
   return null;
+}
+
+function findKokyoFrontSheet_(ss) {
+  return (
+    findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_FRONT) ||
+    findTargetSheetByPattern_(ss, '法人事業概況説明書(表面)固定項目') ||
+    findTargetSheetByPattern_(ss, '法人事業概況説明書(表面)')
+  );
+}
+
+function findKokyoBackSheet_(ss) {
+  // 裏面は「月別の売上高等の状況」を最優先で使用（D19/E19 等の計算で使うため）
+  return (
+    findTargetSheetByPattern_(ss, '月別の売上高等の状況') ||
+    findTargetSheetByPattern_(ss, '法人事業概況説明書(裏面)月別の売上高等の状況') ||
+    findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_BACK) ||
+    findTargetSheetByPattern_(ss, '法人事業概況説明書(裏面)固定項目') ||
+    findTargetSheetByPattern_(ss, '法人事業概況説明書(裏面)')
+  );
 }
 
 function parseKeyValueSheet_(sheet) {
