@@ -1,27 +1,32 @@
 /*************************************************
  * 決算チェックツール 完全版
- * v2026-04-11.02
+ * v2026-04-11.03
  *
  * できること
- * - DriveフォルダIDを受け取り
- * - 同じフォルダに結果スプレッドシートを作成
+ * - DriveフォルダIDを受け取り、同じフォルダに結果スプレッドシートを作成
  * - テンプレート（このGASが紐づくスプレッドシート）を丸ごとコピー
  * - フォルダ内の Googleスプレッドシート / Excel を取り込み
- * - 変換に使った一時スプレッドシートと元Excelを old フォルダへ移動
- * - runChecksCore_ で照合
+ * - 変換に使った一時スプレッドシートと元Excelを old フォルダへ移動（設定で切替）
+ * - rules_main / rules_kokyo に基づいて照合
  * - check_result / check_log / report_A4 を出力
  * - 入力値の全般異常チェック + Gemini補助判定
+ * - 概況書の MATCH_DECISION_EXPR, account_match_mode, value_pick_rule 対応
+ * - MATCH_BREAKDOWN_LOOKUP 対応
+ * - lookup_value_col の K+L のような複数列合算対応
+ * - 決算書BS主要科目の未照合チェック
  *
  * 注意
  * - PDFのOCR読取はこの版では未実装
  * - 決算書は「決算書」というシート名で結果ブックに入る前提
  * - Advanced Drive API を ON にしてください
- * - スクリプトプロパティ:
- *     GEMINI_API_KEY = Gemini API Key（任意）
+ * - スクリプトプロパティ（任意）:
+ *     GEMINI_API_KEY = Gemini API Key
+ *     MOVE_EXCEL_TO_OLD = true / false
+ *     MOVE_CONVERTED_TO_OLD = true / false
  *************************************************/
 
 const CONFIG = {
-  TEMPLATE_SHEET_ID: '', // 空欄ならこのGASが紐づくスプレッドシートを使う
+  TEMPLATE_SHEET_ID: '',
   RESULT_FILE_PREFIX: '決算チェック_',
 
   SHEET_DECISION: '決算書',
@@ -90,6 +95,50 @@ function testRunFromPrompt() {
 /* =========================
  * フォルダ単位実行
  * ========================= */
+
+function getFlag_(key, defaultValue) {
+  const v = PropertiesService.getScriptProperties().getProperty(key);
+  if (v === null || v === '') return !!defaultValue;
+  return String(v).toLowerCase() === 'true';
+}
+
+function getMoveExcelToOldFlag_() {
+  return getFlag_('MOVE_EXCEL_TO_OLD', true);
+}
+
+function getMoveConvertedToOldFlag_() {
+  return getFlag_('MOVE_CONVERTED_TO_OLD', true);
+}
+
+function getOrCreateOldFolder_(parentFolder) {
+  const folders = parentFolder.getFoldersByName('old');
+  if (folders.hasNext()) return folders.next();
+  return parentFolder.createFolder('old');
+}
+
+function moveFileToOldIfNeeded_(file, oldFolder, enabled) {
+  if (!enabled || !file || !oldFolder) return;
+
+  try {
+    const parents = file.getParents();
+    while (parents.hasNext()) {
+      const p = parents.next();
+      if (p.getId() === oldFolder.getId()) return;
+    }
+
+    oldFolder.addFile(file);
+
+    const parents2 = file.getParents();
+    while (parents2.hasNext()) {
+      const p = parents2.next();
+      if (p.getId() !== oldFolder.getId()) {
+        p.removeFile(file);
+      }
+    }
+  } catch (e) {
+    Logger.log(`old移動失敗: ${file.getName()} / ${e.message}`);
+  }
+}
 
 function runFromFolder_(folderId) {
   const folder = DriveApp.getFolderById(folderId);
@@ -162,14 +211,17 @@ function importGoogleSpreadsheetFile_(file, resultSs) {
 }
 
 function importExcelFile_(file, folder, oldFolder, resultSs) {
+  const moveExcelToOld = getMoveExcelToOldFlag_();
+  const moveConvertedToOld = getMoveConvertedToOldFlag_();
+
   const tempSs = convertExcelToSpreadsheet_(file, folder);
 
   try {
     copySourceSheets_(tempSs, resultSs, file.getName());
     appendLogRow_(resultSs, `Excel取込: ${file.getName()}`);
   } finally {
-    moveFileToFolder_(DriveApp.getFileById(tempSs.getId()), oldFolder);
-    moveFileToFolder_(file, oldFolder);
+    moveFileToOldIfNeeded_(file, oldFolder, moveExcelToOld);
+    moveFileToOldIfNeeded_(DriveApp.getFileById(tempSs.getId()), oldFolder, moveConvertedToOld);
   }
 }
 
@@ -232,30 +284,6 @@ function isExcelMimeType_(mimeType) {
   ].includes(mimeType);
 }
 
-function getOrCreateOldFolder_(parentFolder) {
-  const folders = parentFolder.getFoldersByName('old');
-  if (folders.hasNext()) return folders.next();
-  return parentFolder.createFolder('old');
-}
-
-function moveFileToFolder_(file, targetFolder) {
-  const parents = file.getParents();
-  while (parents.hasNext()) {
-    const p = parents.next();
-    if (p.getId() === targetFolder.getId()) return;
-  }
-
-  targetFolder.addFile(file);
-
-  const parents2 = file.getParents();
-  while (parents2.hasNext()) {
-    const p = parents2.next();
-    if (p.getId() !== targetFolder.getId()) {
-      p.removeFile(file);
-    }
-  }
-}
-
 /* =========================
  * 手動実行（このブック）
  * ========================= */
@@ -294,70 +322,6 @@ function runChecksCore_(ss) {
     const sec = Math.round((new Date() - startedAt) / 1000);
     appendLogRow_(ss, `処理時間 ${sec} 秒`);
   }
-}
-
-function buildUnusedBSAccountResults_(ctx) {
-  const results = [];
-
-  const excluded = new Set([
-    '現金及び預金',
-    '売掛金',
-    '買掛金',
-    '未払金',
-    '未払費用',
-    '長期借入金',
-    '短期借入金',
-    '役員借入金',
-    '貸付金',
-    '短期貸付金',
-    '長期貸付金',
-    '土地',
-    '建物',
-    '機械装置',
-    '車両',
-    '車両運搬具',
-    '商品',
-    '製品',
-    '半製品',
-    '仕掛品',
-    '原材料',
-    '貯蔵品',
-    '有価証券',
-    '出資金',
-    '預託金',
-    '仮払金',
-    '仮受金',
-    '受取手形',
-    '支払手形'
-  ]);
-
-  ctx.bsAccounts.forEach(account => {
-    const a = normalizeText_(account);
-    if (!a) return;
-
-    // 今回は主要科目だけ対象。対象外は出さない
-    if (!excluded.has(a)) return;
-
-    if (!ctx.usedDecisionAccounts.has(a)) {
-      results.push(makeResult_({
-        status: '要確認',
-        category: '未照合BS科目',
-        ruleId: 'BS001',
-        sheetName: CONFIG.SHEET_DECISION,
-        itemName: a,
-        targetCell: '',
-        jumpUrl: '',
-        decisionValue: ctx.decisionMap[a] || '',
-        compareValue: '',
-        diff: '',
-        condition: 'UNUSED_BS_ACCOUNT',
-        message: '決算書のBS科目ですが、今回どの内訳書照合にも使用されていません',
-        detail: '',
-      }));
-    }
-  });
-
-  return results;
 }
 
 function resetResultSheets() {
@@ -402,6 +366,8 @@ function buildContext_(ss) {
 
   return {
     ss,
+    decisionSheet,
+    decisionValues: decisionSheet.getDataRange().getValues(),
     decisionMap: parsed.map,
     bsAccounts: parsed.bsAccounts,
     usedDecisionAccounts: new Set(),
@@ -411,6 +377,68 @@ function buildContext_(ss) {
     rulesMain: loadRulesMain_(ss),
     rulesKokyo: loadRulesKokyo_(ss),
   };
+}
+
+function buildUnusedBSAccountResults_(ctx) {
+  const results = [];
+
+  const targetSet = new Set([
+    '現金及び預金',
+    '売掛金',
+    '買掛金',
+    '未払金',
+    '未払費用',
+    '長期借入金',
+    '短期借入金',
+    '役員借入金',
+    '貸付金',
+    '短期貸付金',
+    '長期貸付金',
+    '土地',
+    '建物',
+    '機械装置',
+    '車両',
+    '車両運搬具',
+    '商品',
+    '製品',
+    '半製品',
+    '仕掛品',
+    '原材料',
+    '貯蔵品',
+    '有価証券',
+    '出資金',
+    '預託金',
+    '仮払金',
+    '仮受金',
+    '受取手形',
+    '支払手形'
+  ]);
+
+  ctx.bsAccounts.forEach(account => {
+    const a = normalizeText_(account);
+    if (!a) return;
+    if (!targetSet.has(a)) return;
+
+    if (!ctx.usedDecisionAccounts.has(a)) {
+      results.push(makeResult_({
+        status: '要確認',
+        category: '未照合BS科目',
+        ruleId: 'BS001',
+        sheetName: CONFIG.SHEET_DECISION,
+        itemName: a,
+        targetCell: '',
+        jumpUrl: '',
+        decisionValue: ctx.decisionMap[a] || '',
+        compareValue: '',
+        diff: '',
+        condition: 'UNUSED_BS_ACCOUNT',
+        message: '決算書のBS科目ですが、今回どの内訳書照合にも使用されていません',
+        detail: '',
+      }));
+    }
+  });
+
+  return results;
 }
 
 /* =========================
@@ -462,16 +490,16 @@ function runMainRules_(ss, ctx) {
           results.push(...checkFixedValue_(rule, targetSheet, display, ctx));
           break;
         case 'NOT_BLANK_WHEN_PRESENT':
-          results.push(...checkNotBlankWhenPresent_(rule, targetSheet, display));
+          results.push(...checkNotBlankWhenPresent_(rule, targetSheet, display, ctx));
           break;
         case 'NOT_BLANK_WHEN_AMOUNT_EXISTS':
-          results.push(...checkNotBlankWhenAmountExists_(rule, targetSheet, rows));
+          results.push(...checkNotBlankWhenAmountExists_(rule, targetSheet, rows, ctx));
           break;
         case 'HEADER_CHECK':
-          results.push(...checkHeader_(rule, targetSheet, display));
+          results.push(...checkHeader_(rule, targetSheet, display, ctx));
           break;
         case 'TITLE_CHECK':
-          results.push(...checkTitle_(rule, targetSheet, display));
+          results.push(...checkTitle_(rule, targetSheet, display, ctx));
           break;
         case 'NORMALIZE_SUM':
           results.push(...checkNormalizeSum_(rule, targetSheet, rows, ctx));
@@ -576,6 +604,8 @@ function checkSumByAccount_(rule, sheet, rows, ctx) {
 
   const results = [];
   Object.keys(sums).sort().forEach(account => {
+    markDecisionAccountUsed_(ctx, account);
+
     const a1 = toA1_(rowMap[account] + 1, amountCol + 1);
     const jumpUrl = buildRangeUrl_(ctx.ss, sheet.getName(), a1);
     const decisionValue = ctx.decisionMap[account];
@@ -673,7 +703,7 @@ function checkFixedValue_(rule, sheet, displayValues, ctx) {
   return [compareNumbersResult_(rule, sheet.getName(), rule.header_name, target, value, '内訳書', a1, buildRangeUrl_(ctx.ss, sheet.getName(), a1))];
 }
 
-function checkNotBlankWhenPresent_(rule, sheet, displayValues) {
+function checkNotBlankWhenPresent_(rule, sheet, displayValues, ctx) {
   const found = findCellByText_(displayValues, rule.header_name);
   if (!found) {
     return [makeResult_({
@@ -703,7 +733,7 @@ function checkNotBlankWhenPresent_(rule, sheet, displayValues) {
     sheetName: sheet.getName(),
     itemName: rule.header_name,
     targetCell: a1,
-    jumpUrl: buildRangeUrl_(SpreadsheetApp.getActiveSpreadsheet(), sheet.getName(), a1),
+    jumpUrl: buildRangeUrl_(ctx.ss, sheet.getName(), a1),
     decisionValue: '',
     compareValue: value || '',
     diff: '',
@@ -713,7 +743,7 @@ function checkNotBlankWhenPresent_(rule, sheet, displayValues) {
   })];
 }
 
-function checkNotBlankWhenAmountExists_(rule, sheet, rows) {
+function checkNotBlankWhenAmountExists_(rule, sheet, rows, ctx) {
   const amountCol = colToIndex_(rule.amount_col);
   const targetBlankCol = colToIndex_('M');
 
@@ -740,7 +770,7 @@ function checkNotBlankWhenAmountExists_(rule, sheet, rows) {
     sheetName: sheet.getName(),
     itemName: rule.document_type,
     targetCell: a1,
-    jumpUrl: a1 ? buildRangeUrl_(SpreadsheetApp.getActiveSpreadsheet(), sheet.getName(), a1) : '',
+    jumpUrl: a1 ? buildRangeUrl_(ctx.ss, sheet.getName(), a1) : '',
     decisionValue: '',
     compareValue: '',
     diff: '',
@@ -750,7 +780,7 @@ function checkNotBlankWhenAmountExists_(rule, sheet, rows) {
   })];
 }
 
-function checkHeader_(rule, sheet, displayValues) {
+function checkHeader_(rule, sheet, displayValues, ctx) {
   const found = findCellByText_(displayValues, rule.header_name);
   const a1 = found ? toA1_(found.row + 1, found.col + 1) : '';
 
@@ -761,7 +791,7 @@ function checkHeader_(rule, sheet, displayValues) {
     sheetName: sheet.getName(),
     itemName: rule.header_name,
     targetCell: a1,
-    jumpUrl: a1 ? buildRangeUrl_(SpreadsheetApp.getActiveSpreadsheet(), sheet.getName(), a1) : '',
+    jumpUrl: a1 ? buildRangeUrl_(ctx.ss, sheet.getName(), a1) : '',
     decisionValue: '',
     compareValue: found ? rule.header_name : '',
     diff: '',
@@ -771,7 +801,7 @@ function checkHeader_(rule, sheet, displayValues) {
   })];
 }
 
-function checkTitle_(rule, sheet, displayValues) {
+function checkTitle_(rule, sheet, displayValues, ctx) {
   const found = findCellByText_(displayValues, rule.header_name);
   const a1 = found ? toA1_(found.row + 1, found.col + 1) : '';
 
@@ -782,7 +812,7 @@ function checkTitle_(rule, sheet, displayValues) {
     sheetName: sheet.getName(),
     itemName: rule.header_name,
     targetCell: a1,
-    jumpUrl: a1 ? buildRangeUrl_(SpreadsheetApp.getActiveSpreadsheet(), sheet.getName(), a1) : '',
+    jumpUrl: a1 ? buildRangeUrl_(ctx.ss, sheet.getName(), a1) : '',
     decisionValue: '',
     compareValue: found ? rule.header_name : '',
     diff: '',
@@ -824,6 +854,8 @@ function checkNormalizeSum_(rule, sheet, rows, ctx) {
 
   const results = [];
   Object.keys(sums).sort().forEach(account => {
+    markDecisionAccountUsed_(ctx, account);
+
     const decisionValue = ctx.decisionMap[account];
     const a1 = toA1_(rowMap[account] + 1, amountCol + 1);
     const jumpUrl = buildRangeUrl_(ctx.ss, sheet.getName(), a1);
@@ -933,7 +965,31 @@ function runKokyoRules_(ss, ctx) {
 
         case 'MATCH_DECISION': {
           const frontValue = toNumber_(frontMap[rule.item_name]);
-          let decisionValue = resolveDecisionExpression_(rule.source_detail, ctx);
+          let decisionValue = resolveDecisionExprWithPickRule_(
+            rule.source_detail,
+            ctx.decisionValues,
+            rule.value_pick_rule || 'C>B',
+            ctx,
+            rule.account_match_mode || 'exact'
+          );
+
+          if (decisionValue != null) {
+            decisionValue = toKiloYenFloor_(decisionValue);
+          }
+
+          results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, decisionValue, frontValue, '概況書', '', ''));
+          break;
+        }
+
+        case 'MATCH_DECISION_EXPR': {
+          const frontValue = toNumber_(frontMap[rule.item_name]);
+          let decisionValue = resolveDecisionExprWithPickRule_(
+            rule.source_detail,
+            ctx.decisionValues,
+            rule.value_pick_rule || 'C>B',
+            ctx,
+            rule.account_match_mode || 'exact'
+          );
 
           if (decisionValue != null) {
             decisionValue = toKiloYenFloor_(decisionValue);
@@ -959,6 +1015,13 @@ function runKokyoRules_(ss, ctx) {
             message: rule.message,
             detail: rule.source_detail || '',
           }));
+          break;
+        }
+
+        case 'MATCH_BREAKDOWN_LOOKUP': {
+          const frontValue = toNumber_(frontMap[rule.item_name]);
+          const lookupValue = resolveBreakdownLookupValue_(ss, rule);
+          results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
           break;
         }
 
@@ -1038,6 +1101,196 @@ function runKokyoRules_(ss, ctx) {
   return results;
 }
 
+function resolveBreakdownLookupValue_(ss, rule) {
+  const nameSourceSheet = findTargetSheetByPattern_(ss, rule.lookup_name_source);
+  if (!nameSourceSheet) return null;
+
+  const nameCell = String(rule.lookup_name_cell || '').trim();
+  let representativeName = '';
+  if (nameCell) {
+    representativeName = normalizeText_(nameSourceSheet.getRange(nameCell).getDisplayValue());
+  }
+
+  const targetSheet = findTargetSheetByPattern_(ss, rule.lookup_sheet_pattern || rule.source_detail);
+  if (!targetSheet) return null;
+
+  const values = targetSheet.getDataRange().getDisplayValues();
+  const matchCol = colToIndex_(rule.lookup_match_col);
+  const matchMode = rule.account_match_mode || 'contains';
+
+  if (matchCol < 0) return null;
+
+  for (let r = 0; r < values.length; r++) {
+    const cellText = values[r][matchCol];
+    if (!cellText) continue;
+
+    if (!representativeName || isMatchByMode_(cellText, representativeName, matchMode)) {
+      return getMultiColValue_(values[r], rule.lookup_value_col);
+    }
+  }
+
+  return null;
+}
+
+function isMatchByMode_(cellText, targetText, mode) {
+  const cell = normalizeText_(cellText);
+  const target = normalizeText_(targetText);
+  const m = String(mode || 'exact').toLowerCase();
+
+  if (!cell || !target) return false;
+
+  if (m === 'exact') return cell === target;
+  if (m === 'prefix') return cell.startsWith(target);
+  if (m === 'suffix') return cell.endsWith(target);
+  if (m === 'contains') return cell.includes(target);
+
+  return cell === target;
+}
+
+function getMultiColValue_(row, colExpr) {
+  if (!colExpr) return 0;
+
+  const cols = String(colExpr).split('+');
+  let total = 0;
+
+  cols.forEach(c => {
+    const idx = colToIndex_(c.trim());
+    if (idx >= 0) {
+      total += toNumber_(row[idx] || 0);
+    }
+  });
+
+  return total;
+}
+
+function resolveDecisionExprWithPickRule_(expr, values, valuePickRule, ctx, matchMode) {
+  const text = normalizeText_(expr);
+  if (!text) return null;
+
+  const tokens = text.match(/[+-]?[^+-]+/g);
+  if (!tokens) return null;
+
+  let total = 0;
+  let foundAny = false;
+
+  for (const token of tokens) {
+    const sign = token.startsWith('-') ? -1 : 1;
+    const raw = token.replace(/^[+-]/, '');
+    const part = normalizeText_(raw);
+
+    let value = null;
+
+    if (ctx.groups[part]) {
+      value = 0;
+      let foundGroup = false;
+
+      for (const acc of ctx.groups[part]) {
+        const matchedRows = findDecisionRowsByAccount_(values, acc, 'exact');
+        for (const row of matchedRows) {
+          const v = pickValueByRule_(row, valuePickRule);
+          if (v != null) {
+            value += v;
+            foundGroup = true;
+            markDecisionAccountUsed_(ctx, acc);
+          }
+        }
+      }
+
+      if (!foundGroup) value = null;
+    } else {
+      const matchedRows = findDecisionRowsByAccount_(values, part, matchMode || 'exact');
+
+      if (matchedRows.length > 0) {
+        value = 0;
+        let foundRowValue = false;
+
+        for (const row of matchedRows) {
+          const v = pickValueByRule_(row, valuePickRule);
+          if (v != null) {
+            value += v;
+            foundRowValue = true;
+          }
+        }
+
+        if (!foundRowValue) {
+          value = null;
+        } else {
+          markDecisionAccountUsed_(ctx, part);
+        }
+      }
+    }
+
+    if (value != null) {
+      total += sign * value;
+      foundAny = true;
+    }
+  }
+
+  return foundAny ? total : null;
+}
+
+function findDecisionRowsByAccount_(values, accountName, matchMode) {
+  const target = normalizeText_(accountName);
+  const rows = [];
+  const mode = String(matchMode || 'exact').toLowerCase();
+
+  for (let r = 0; r < values.length; r++) {
+    const cell = normalizeText_(values[r][0]);
+    if (!cell) continue;
+
+    let hit = false;
+
+    if (mode === 'exact') {
+      hit = (cell === target);
+    } else if (mode === 'prefix') {
+      hit = cell.startsWith(target);
+    } else if (mode === 'suffix') {
+      hit = cell.endsWith(target);
+    } else if (mode === 'contains') {
+      hit = cell.includes(target);
+    } else {
+      hit = (cell === target);
+    }
+
+    if (hit) rows.push(values[r]);
+  }
+
+  return rows;
+}
+
+function pickValueByRule_(row, ruleText) {
+  const rule = String(ruleText || 'C>B').trim().toUpperCase();
+
+  const colMap = {
+    A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14
+  };
+
+  if (rule === 'B_ONLY') return toNumber_(row[colMap.B]);
+  if (rule === 'C_ONLY') return toNumber_(row[colMap.C]);
+
+  if (rule === 'RIGHTMOST') {
+    for (let i = row.length - 1; i >= 0; i--) {
+      const n = toNumber_(row[i]);
+      if (n != null) return n;
+    }
+    return null;
+  }
+
+  const order = rule.split('>').map(s => s.trim()).filter(Boolean);
+  for (const col of order) {
+    if (colMap[col] == null) continue;
+    const n = toNumber_(row[colMap[col]]);
+    if (n != null) return n;
+  }
+
+  for (let i = row.length - 1; i >= 0; i--) {
+    const n = toNumber_(row[i]);
+    if (n != null) return n;
+  }
+
+  return null;
+}
+
 /* =========================
  * 入力値全般チェック + Gemini
  * ========================= */
@@ -1058,50 +1311,52 @@ function runGlobalInputAnomalyChecks_(ss) {
   const aiCache = {};
 
   ss.getSheets().forEach(sheet => {
-    const name = sheet.getName();
-    if (ignoreSheets.has(name)) return;
+    const sheetName = sheet.getName();
+    if (ignoreSheets.has(sheetName)) return;
+    if (!normalizeText_(sheetName).includes('の内訳')) return;
 
-    const range = sheet.getDataRange();
-    const values = range.getDisplayValues();
+    const values = sheet.getDataRange().getDisplayValues();
+    const startCol = 2;
+    const endCol = 21;
 
     for (let r = 0; r < values.length; r++) {
-      for (let c = 0; c < values[r].length; c++) {
-        const text = normalizeText_(values[r][c]);
+      for (let c = startCol - 1; c <= endCol - 1; c++) {
+        const raw = values[r][c];
+        const text = String(raw || '').trim();
         if (!text) continue;
         if (/^[0-9,\.\-△()\/年月日円千百]+$/.test(text)) continue;
         if (text.length <= 1) continue;
 
-        const localReason = detectInputAnomalyReason_(text);
-        if (!localReason) continue;
-
         let ai = aiCache[text];
         if (!ai) {
-          ai = callGeminiCheckSafe_(text);
+          ai = callGeminiBreakdownCheckSafe_(text, sheetName);
           aiCache[text] = ai;
-          Utilities.sleep(200);
+          Utilities.sleep(120);
         }
 
+        if (!ai || !ai.is_suspicious) continue;
+
         const a1 = toA1_(r + 1, c + 1);
-        const jumpUrl = buildRangeUrl_(ss, name, a1);
+        const jumpUrl = buildRangeUrl_(ss, sheetName, a1);
 
         results.push(makeResult_({
           status: '要確認',
           category: '入力値チェック',
           ruleId: 'AI001',
-          sheetName: name,
+          sheetName: sheetName,
           itemName: `${a1}: ${text}`,
           targetCell: a1,
           jumpUrl: jumpUrl,
           decisionValue: '',
           compareValue: text,
           diff: '',
-          condition: 'GLOBAL_TEXT_CHECK',
-          message: localReason,
+          condition: 'BREAKDOWN_TEXT_GEMINI_CHECK',
+          message: ai.reason || '不自然な入力の可能性があります',
           detail: '',
-          aiJudge: ai ? (ai.is_suspicious ? '不自然' : '要確認') : '未判定',
-          aiReason: ai ? (ai.reason || '') : '',
-          aiSuggestion1: ai && ai.suggestions && ai.suggestions[0] ? ai.suggestions[0] : '',
-          aiSuggestion2: ai && ai.suggestions && ai.suggestions[1] ? ai.suggestions[1] : '',
+          aiJudge: ai.is_suspicious ? '不自然' : '問題なし',
+          aiReason: ai.reason || '',
+          aiSuggestion1: ai.suggestions && ai.suggestions[0] ? ai.suggestions[0] : '',
+          aiSuggestion2: ai.suggestions && ai.suggestions[1] ? ai.suggestions[1] : '',
         }));
       }
     }
@@ -1110,51 +1365,58 @@ function runGlobalInputAnomalyChecks_(ss) {
   return results;
 }
 
-function detectInputAnomalyReason_(text) {
-  if (/[�]/.test(text)) return '文字化けの可能性があります';
-  if (/(Ã|â|œ|‰)/.test(text)) return '文字コード崩れの可能性があります';
-  if (/\?\?+/.test(text)) return '文字化けの可能性があります';
-  if (/[\u0000-\u001F\u007F]/.test(text)) return '制御文字が含まれています';
+function callGemini_(text) {
+  const props = PropertiesService.getScriptProperties();
 
-  if (/([一-龠々ヶァ-ヴーぁ-ん])\1/.test(text)) {
-    if (!/(佐々木|久々|代々|堂々|人々|様々)/.test(text)) {
-      return '同じ文字の不自然な重複の可能性があります';
+  const apiKey = props.getProperty("GEMINI_API_KEY");
+  const model =
+    props.getProperty("GEMINI_MODEL") ||
+    "gemini-3.1-pro-preview";
+
+  if (!apiKey) {
+    return "Geminiキー未設定";
+  }
+
+  const url =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    model +
+    ":generateContent?key=" +
+    apiKey;
+
+  const payload = {
+    contents: [
+      {
+        parts: [
+          {
+            text:
+              "以下の日本語の誤字・不自然表現・文字化けをチェックし、修正案を簡潔に提示してください。\n\n" +
+              text
+          }
+        ]
+      }
+    ],
+    generationConfig: {
+      temperature: 0.2
     }
+  };
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const json = JSON.parse(res.getContentText());
+
+  if (json.error) {
+    return "Geminiエラー: " + json.error.message;
   }
 
-  if (/([一-龠ぁ-んァ-ヴー]{2,})\1/.test(text)) {
-    return '語の重複入力の可能性があります';
-  }
-
-  const hasHalfKana = /[｡-ﾟ]/.test(text);
-  const hasFullKana = /[ァ-ヴ]/.test(text);
-  const hasAlpha = /[A-Za-z]/.test(text);
-  const hasJapanese = /[一-龠ぁ-んァ-ヴ]/.test(text);
-
-  if ((hasHalfKana && hasFullKana) || (hasAlpha && hasJapanese && /\s/.test(text))) {
-    return '文字種の混在が不自然です';
-  }
-
-  return '';
+  return json.candidates?.[0]?.content?.parts?.[0]?.text || "応答なし";
 }
 
-function getGeminiApiKey_() {
-  return PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-}
-
-function callGeminiCheckSafe_(text) {
-  try {
-    return callGeminiCheck_(text);
-  } catch (e) {
-    return {
-      is_suspicious: true,
-      reason: `Gemini判定失敗: ${e.message}`,
-      suggestions: []
-    };
-  }
-}
-
-function callGeminiCheck_(text) {
+function callGeminiBreakdownCheck_(text, sheetName) {
   const apiKey = getGeminiApiKey_();
   if (!apiKey) {
     return {
@@ -1167,26 +1429,46 @@ function callGeminiCheck_(text) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
 
   const prompt = `
-あなたは税務書類の入力値チェック支援AIです。
-次の文字列が日本語として不自然か、誤入力・重複入力・文字化け・綴り違いの可能性があるか判定してください。
-固有名詞の可能性もあるため、断定しすぎず要確認ベースで判断してください。
-不自然な場合は修正候補を最大2件返してください。
+あなたは税務申告書の内訳書チェック支援AIです。
+対象は「○○の内訳」シートの入力値です。
+次の文字列が、税務書類の入力値として不自然かどうか判定してください。
 
+特に次の観点を重視してください。
+- 誤字脱字
+- 文字化け
+- 同じ語の重複（例: 所沢沢）
+- 半角カナと全角カナの混在
+- 全角英数字と半角英数字の不自然混在
+- 日本語と英字の不自然な連結（例: F菱UFJ銀行）
+- 銀行名・会社名・地名・氏名として不自然
+- 明らかな入力ミスの可能性
+
+注意:
+- 珍しい固有名詞の可能性もあるため、断定しすぎず要確認ベースで判断してください。
+- 明らかに自然で問題ない場合は is_suspicious を false にしてください。
+- 修正候補は最大2件まで。
+- JSONだけ返してください。
+
+シート名: ${sheetName}
 入力文字列: ${text}
 
-必ずJSONだけで返してください。
+返却形式:
 {
   "is_suspicious": true,
-  "reason": "不自然な理由",
+  "reason": "不自然だと考える理由",
   "suggestions": ["候補1", "候補2"]
 }
 `.trim();
 
   const payload = {
-    contents: [{ parts: [{ text: prompt }] }],
+    contents: [
+      {
+        parts: [{ text: prompt }]
+      }
+    ],
     generationConfig: {
       temperature: 0.1,
-      responseMimeType: "application/json"
+      responseMimeType: 'application/json'
     }
   };
 
@@ -1295,7 +1577,7 @@ function buildA4Report_(ss) {
 
   if (report.getFilter()) report.getFilter().remove();
   report.getDataRange().createFilter();
-   report.setHiddenGridlines(true);
+  report.setHiddenGridlines(true);
 }
 
 /* =========================
@@ -1379,31 +1661,6 @@ function isRealBSAccount_(key) {
 
   return true;
 }
-
-function markDecisionAccountUsed_(ctx, accountName) {
-  const a = normalizeText_(accountName);
-  if (!a) return;
-  ctx.usedDecisionAccounts.add(a);
-}
-
-function markDecisionExpressionUsed_(ctx, expr) {
-  const text = normalizeText_(expr);
-  if (!text) return;
-
-  const parts = text.split('+').map(s => normalizeText_(s)).filter(Boolean);
-  parts.forEach(part => {
-    if (ctx.groups[part]) {
-      ctx.groups[part].forEach(acc => markDecisionAccountUsed_(ctx, acc));
-    } else {
-      markDecisionAccountUsed_(ctx, part);
-    }
-  });
-}
-
-
-/* =========================
- * ルール・マスタ読込
- * ========================= */
 
 function loadRulesMain_(ss) {
   return loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_RULES_MAIN));
@@ -1494,6 +1751,26 @@ function resolveDecisionExpression_(expr, ctx) {
   return foundAny ? total : null;
 }
 
+function markDecisionAccountUsed_(ctx, accountName) {
+  const a = normalizeText_(accountName);
+  if (!a) return;
+  ctx.usedDecisionAccounts.add(a);
+}
+
+function markDecisionExpressionUsed_(ctx, expr) {
+  const text = normalizeText_(expr);
+  if (!text) return;
+
+  const parts = text.split('+').map(s => normalizeText_(s)).filter(Boolean);
+  parts.forEach(part => {
+    if (ctx.groups[part]) {
+      ctx.groups[part].forEach(acc => markDecisionAccountUsed_(ctx, acc));
+    } else {
+      markDecisionAccountUsed_(ctx, part);
+    }
+  });
+}
+
 function toKiloYenFloor_(value) {
   if (value === null || value === '' || isNaN(value)) return null;
   return Math.floor(Number(value) / 1000);
@@ -1567,20 +1844,45 @@ function evaluateConditionAgainstDecision_(condition, ctx) {
   const text = normalizeText_(condition);
   if (!text) return false;
 
-  const m = text.match(/^(.+?)>0$/);
+  const m = text.match(/^(.+?)(>=|<=|>|<|=)(.+)$/);
   if (!m) return false;
 
   const expr = normalizeText_(m[1]);
-  const value = resolveDecisionExpression_(expr, ctx);
-  return (value || 0) > 0;
+  const op = m[2];
+  const rhs = Number(m[3]);
+  const value = resolveDecisionExpression_(expr, ctx) || 0;
+
+  switch (op) {
+    case '>': return value > rhs;
+    case '<': return value < rhs;
+    case '>=': return value >= rhs;
+    case '<=': return value <= rhs;
+    case '=': return value === rhs;
+    default: return false;
+  }
 }
 
 function evaluateCellExpression_(expr, values) {
   const text = normalizeText_(expr);
   if (!text) return null;
 
-  const parts = text.split('+').map(s => normalizeText_(s)).filter(Boolean);
-  return parts.reduce((sum, ref) => sum + (getCellByA1_(values, ref) || 0), 0);
+  const tokens = text.match(/[+-]?[^+-]+/g);
+  if (!tokens) return null;
+
+  let total = 0;
+  let foundAny = false;
+
+  for (const token of tokens) {
+    const sign = token.startsWith('-') ? -1 : 1;
+    const ref = token.replace(/^[+-]/, '');
+    const v = getCellByA1_(values, ref);
+    if (v != null) {
+      total += sign * v;
+      foundAny = true;
+    }
+  }
+
+  return foundAny ? total : null;
 }
 
 function getCellByA1_(values, a1) {
@@ -1665,6 +1967,12 @@ function mergeExcludeAccounts_(ruleExclude, masterSet) {
   return set;
 }
 
+function buildRangeUrl_(ss, sheetName, a1) {
+  const sh = ss.getSheetByName(sheetName);
+  if (!sh || !a1) return '';
+  return `${ss.getUrl()}#gid=${sh.getSheetId()}&range=${encodeURIComponent(a1)}`;
+}
+
 function compareNumbersResult_(rule, sheetName, itemName, decisionValue, compareValue, category, targetCell, jumpUrl) {
   const d = toNumber_(decisionValue);
   const c = toNumber_(compareValue);
@@ -1725,12 +2033,6 @@ function ngHeaderNotFound_(rule, sheet) {
   });
 }
 
-function buildRangeUrl_(ss, sheetName, a1) {
-  const sh = ss.getSheetByName(sheetName);
-  if (!sh || !a1) return '';
-  return `${ss.getUrl()}#gid=${sh.getSheetId()}&range=${encodeURIComponent(a1)}`;
-}
-
 function toA1_(row, col) {
   let s = '';
   while (col > 0) {
@@ -1780,7 +2082,10 @@ function getNowStr_() {
 }
 
 function normalizeText_(v) {
-  return String(v == null ? '' : v).replace(/\s+/g, '').trim();
+  return String(v || '')
+    .replace(/\s/g, '')
+    .replace(/[　]/g, '')
+    .trim();
 }
 
 function isBlank_(v) {
