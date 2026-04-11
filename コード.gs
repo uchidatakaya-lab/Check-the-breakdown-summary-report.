@@ -450,6 +450,7 @@ function runMainRules_(ss, ctx) {
 
   for (const rule of ctx.rulesMain) {
     if (!toBoolean_(rule.enabled)) continue;
+    const checkType = normalizeCheckType_(rule.check_type || rule.checktype || rule['check type']);
 
     const targetSheet = findTargetSheetByPattern_(ss, rule.file_pattern);
     if (!targetSheet) {
@@ -476,7 +477,7 @@ function runMainRules_(ss, ctx) {
     const display = sheetData.displayValues;
 
     try {
-      switch (rule.check_type) {
+      switch (checkType) {
         case 'SUM_MATCH':
           results.push(...checkSumMatch_(rule, targetSheet, rows, ctx));
           break;
@@ -516,8 +517,8 @@ function runMainRules_(ss, ctx) {
             decisionValue: '',
             compareValue: '',
             diff: '',
-            condition: rule.check_type,
-            message: `未対応のcheck_typeです: ${rule.check_type}`,
+            condition: checkType || '',
+            message: `未対応のcheck_typeです: ${checkType || '(空欄)'}`,
             detail: '',
           }));
       }
@@ -917,9 +918,10 @@ function runKokyoRules_(ss, ctx) {
 
   for (const rule of ctx.rulesKokyo) {
     if (!toBoolean_(rule.enabled)) continue;
+    const checkType = normalizeCheckType_(rule.check_type || rule.checktype || rule['check type']);
 
     try {
-      switch (rule.check_type) {
+      switch (checkType) {
         case 'NOT_BLANK': {
           const value = frontMap[rule.item_name];
           results.push(makeResult_({
@@ -1074,8 +1076,8 @@ function runKokyoRules_(ss, ctx) {
             decisionValue: '',
             compareValue: '',
             diff: '',
-            condition: rule.check_type,
-            message: `未対応のcheck_typeです: ${rule.check_type}`,
+            condition: checkType || '',
+            message: `未対応のcheck_typeです: ${checkType || '(空欄)'}`,
             detail: '',
           }));
       }
@@ -1366,12 +1368,8 @@ function runGlobalInputAnomalyChecks_(ss) {
 }
 
 function callGemini_(text) {
-  const props = PropertiesService.getScriptProperties();
-
-  const apiKey = props.getProperty("GEMINI_API_KEY");
-  const model =
-    props.getProperty("GEMINI_MODEL") ||
-    "gemini-3.1-pro-preview";
+  const apiKey = getGeminiApiKey_();
+  const model = getGeminiModel_();
 
   if (!apiKey) {
     return "Geminiキー未設定";
@@ -1416,6 +1414,15 @@ function callGemini_(text) {
   return json.candidates?.[0]?.content?.parts?.[0]?.text || "応答なし";
 }
 
+function getGeminiApiKey_() {
+  return PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY') || '';
+}
+
+function getGeminiModel_() {
+  const raw = PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || 'gemini-2.5-flash';
+  return String(raw).replace(/^models\//, '');
+}
+
 function callGeminiBreakdownCheck_(text, sheetName) {
   const apiKey = getGeminiApiKey_();
   if (!apiKey) {
@@ -1426,7 +1433,8 @@ function callGeminiBreakdownCheck_(text, sheetName) {
     };
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  const model = getGeminiModel_();
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const prompt = `
 あなたは税務申告書の内訳書チェック支援AIです。
@@ -1497,6 +1505,18 @@ function callGeminiBreakdownCheck_(text, sheetName) {
     reason: parsed.reason || '',
     suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions.slice(0, 2) : []
   };
+}
+
+function callGeminiBreakdownCheckSafe_(text, sheetName) {
+  try {
+    return callGeminiBreakdownCheck_(text, sheetName);
+  } catch (e) {
+    return {
+      is_suspicious: true,
+      reason: `Gemini判定エラー: ${e && e.message ? e.message : String(e)}`,
+      suggestions: []
+    };
+  }
 }
 
 /* =========================
@@ -2086,6 +2106,22 @@ function normalizeText_(v) {
     .replace(/\s/g, '')
     .replace(/[　]/g, '')
     .trim();
+}
+
+function normalizeCheckType_(v) {
+  const t = String(v || '').trim().toUpperCase();
+  if (!t) return '';
+
+  const aliasMap = {
+    'NOTBLANK': 'NOT_BLANK',
+    'CONDITIONALNOTBLANK': 'CONDITIONAL_NOT_BLANK',
+    'MATCHDECISION': 'MATCH_DECISION',
+    'MATCHDECISIONEXPR': 'MATCH_DECISION_EXPR',
+    'MATCHBREAKDOWN': 'MATCH_BREAKDOWN',
+    'MATCHBREAKDOWNLOOKUP': 'MATCH_BREAKDOWN_LOOKUP',
+    'CALCMATCH': 'CALC_MATCH',
+  };
+  return aliasMap[t.replace(/[_\-\s]/g, '')] || t;
 }
 
 function isBlank_(v) {
