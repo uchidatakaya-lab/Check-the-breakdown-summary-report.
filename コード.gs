@@ -21,6 +21,7 @@
  * - Advanced Drive API を ON にしてください
  * - スクリプトプロパティ（任意）:
  *     GEMINI_API_KEY = Gemini API Key
+ *     AI_CHECK_ENABLED = true / false
  *     MOVE_EXCEL_TO_OLD = true / false
  *     MOVE_CONVERTED_TO_OLD = true / false
  *************************************************/
@@ -35,6 +36,7 @@ const CONFIG = {
   SHEET_GROUP_MASTER: 'account_group_master',
   SHEET_NORMALIZE_MASTER: 'account_normalize_master',
   SHEET_EXCLUDE_MASTER: 'account_exclude_master',
+  SHEET_AI_TARGETS: 'ai_check_targets',
 
   SHEET_KOKYO_FRONT: '概況書表面',
   SHEET_KOKYO_BACK: '概況書裏面',
@@ -42,6 +44,7 @@ const CONFIG = {
   SHEET_RESULT: 'check_result',
   SHEET_LOG: 'check_log',
   SHEET_REPORT: 'report_A4',
+  AI_CHECK_START_ROW: 5,
 };
 
 function onOpen() {
@@ -108,6 +111,10 @@ function getMoveExcelToOldFlag_() {
 
 function getMoveConvertedToOldFlag_() {
   return getFlag_('MOVE_CONVERTED_TO_OLD', true);
+}
+
+function getAiCheckEnabledFlag_() {
+  return getFlag_('AI_CHECK_ENABLED', true);
 }
 
 function getOrCreateOldFolder_(parentFolder) {
@@ -307,7 +314,11 @@ function runChecksCore_(ss) {
 
     const mainResults = runMainRules_(ss, ctx);
     const kokyoResults = runKokyoRules_(ss, ctx);
-    const typoResults = runGlobalInputAnomalyChecks_(ss);
+    const aiCheckEnabled = getAiCheckEnabledFlag_();
+    const typoResults = aiCheckEnabled ? runGlobalInputAnomalyChecks_(ss) : [];
+    if (!aiCheckEnabled) {
+      appendLogRow_(ss, 'AI入力値チェックをスキップしました（AI_CHECK_ENABLED=false）');
+    }
     const bsUnusedResults = buildUnusedBSAccountResults_(ctx);
 
     const allResults = [...mainResults, ...kokyoResults, ...typoResults, ...bsUnusedResults];
@@ -450,6 +461,7 @@ function runMainRules_(ss, ctx) {
 
   for (const rule of ctx.rulesMain) {
     if (!toBoolean_(rule.enabled)) continue;
+    const checkType = normalizeCheckType_(rule.check_type || rule.checktype || rule['check type']);
 
     const targetSheet = findTargetSheetByPattern_(ss, rule.file_pattern);
     if (!targetSheet) {
@@ -476,7 +488,7 @@ function runMainRules_(ss, ctx) {
     const display = sheetData.displayValues;
 
     try {
-      switch (rule.check_type) {
+      switch (checkType) {
         case 'SUM_MATCH':
           results.push(...checkSumMatch_(rule, targetSheet, rows, ctx));
           break;
@@ -491,6 +503,9 @@ function runMainRules_(ss, ctx) {
           break;
         case 'NOT_BLANK_WHEN_PRESENT':
           results.push(...checkNotBlankWhenPresent_(rule, targetSheet, display, ctx));
+          break;
+        case 'NOT_BLANK_WHEN_ROW_EXISTS':
+          results.push(...checkNotBlankWhenRowExists_(rule, targetSheet, display, ctx));
           break;
         case 'NOT_BLANK_WHEN_AMOUNT_EXISTS':
           results.push(...checkNotBlankWhenAmountExists_(rule, targetSheet, rows, ctx));
@@ -516,8 +531,8 @@ function runMainRules_(ss, ctx) {
             decisionValue: '',
             compareValue: '',
             diff: '',
-            condition: rule.check_type,
-            message: `未対応のcheck_typeです: ${rule.check_type}`,
+            condition: checkType || '',
+            message: `未対応のcheck_typeです: ${checkType || '(空欄)'}`,
             detail: '',
           }));
       }
@@ -780,6 +795,72 @@ function checkNotBlankWhenAmountExists_(rule, sheet, rows, ctx) {
   })];
 }
 
+function checkNotBlankWhenRowExists_(rule, sheet, displayValues, ctx) {
+  const found = findCellByText_(displayValues, rule.header_name);
+  if (!found) {
+    return [makeResult_({
+      status: '要確認',
+      category: '内訳書',
+      ruleId: rule.rule_id,
+      sheetName: sheet.getName(),
+      itemName: rule.header_name,
+      targetCell: '',
+      jumpUrl: '',
+      decisionValue: '',
+      compareValue: '',
+      diff: '',
+      condition: '固定項目未検出',
+      message: `${rule.header_name} が見つかりません`,
+      detail: '',
+    })];
+  }
+
+  const targetCol = found.col;
+  const startRow = found.row + 1;
+  const triggerCols = parseColumnList_(rule.account_col || 'B');
+
+  let foundBlank = false;
+  let foundRow = -1;
+  for (let r = startRow; r < displayValues.length; r++) {
+    const hasTrigger = triggerCols.some(col => normalizeText_(displayValues[r][col]) !== '');
+    if (!hasTrigger) continue;
+
+    const targetText = normalizeText_(displayValues[r][targetCol]);
+    if (!targetText) {
+      foundBlank = true;
+      foundRow = r;
+      break;
+    }
+  }
+
+  const a1 = foundBlank ? toA1_(foundRow + 1, targetCol + 1) : '';
+  return [makeResult_({
+    status: foundBlank ? (rule.severity || '要確認') : 'OK',
+    category: '内訳書',
+    ruleId: rule.rule_id,
+    sheetName: sheet.getName(),
+    itemName: rule.header_name,
+    targetCell: a1,
+    jumpUrl: a1 ? buildRangeUrl_(ctx.ss, sheet.getName(), a1) : '',
+    decisionValue: '',
+    compareValue: '',
+    diff: '',
+    condition: 'NOT_BLANK_WHEN_ROW_EXISTS',
+    message: foundBlank ? rule.message : 'OK',
+    detail: '',
+  })];
+}
+
+function parseColumnList_(expr) {
+  const raw = String(expr || '').trim();
+  if (!raw) return [1]; // B
+  const parts = raw.split(/[+,]/).map(s => s.trim()).filter(Boolean);
+  const cols = parts
+    .map(p => colToIndex_(p))
+    .filter(i => i >= 0);
+  return cols.length ? cols : [1];
+}
+
 function checkHeader_(rule, sheet, displayValues, ctx) {
   const found = findCellByText_(displayValues, rule.header_name);
   const a1 = found ? toA1_(found.row + 1, found.col + 1) : '';
@@ -909,19 +990,20 @@ function checkNormalizeSum_(rule, sheet, rows, ctx) {
 
 function runKokyoRules_(ss, ctx) {
   const results = [];
-  const frontSheet = ss.getSheetByName(CONFIG.SHEET_KOKYO_FRONT);
-  const backSheet = ss.getSheetByName(CONFIG.SHEET_KOKYO_BACK);
+  const frontSheet = findKokyoFrontSheet_(ss);
+  const backSheet = findKokyoBackSheet_(ss);
 
   const frontMap = frontSheet ? parseKeyValueSheet_(frontSheet) : {};
   const backValues = backSheet ? getSheetValues_(backSheet).values : [];
 
   for (const rule of ctx.rulesKokyo) {
     if (!toBoolean_(rule.enabled)) continue;
+    const checkType = normalizeCheckType_(rule.check_type || rule.checktype || rule['check type']);
 
     try {
-      switch (rule.check_type) {
+      switch (checkType) {
         case 'NOT_BLANK': {
-          const value = frontMap[rule.item_name];
+          const value = getFrontMapValue_(frontMap, rule.item_name);
           results.push(makeResult_({
             status: isBlank_(value) ? (rule.severity || '要確認') : 'OK',
             category: '概況書',
@@ -942,7 +1024,7 @@ function runKokyoRules_(ss, ctx) {
 
         case 'CONDITIONAL_NOT_BLANK': {
           const condOk = evaluateConditionAgainstDecision_(rule.condition, ctx);
-          const value = frontMap[rule.item_name];
+          const value = getFrontMapValue_(frontMap, rule.item_name);
           const bad = condOk && isBlank_(value);
 
           results.push(makeResult_({
@@ -964,7 +1046,16 @@ function runKokyoRules_(ss, ctx) {
         }
 
         case 'MATCH_DECISION': {
-          const frontValue = toNumber_(frontMap[rule.item_name]);
+          const sourceType = normalizeText_(rule.source_type || rule.document_type);
+          const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
+          if (sourceType.includes('内訳書') && hasLookupConfig) {
+            const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
+            const lookupValue = resolveBreakdownLookupValue_(ss, rule);
+            results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
+            break;
+          }
+
+          const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
           let decisionValue = resolveDecisionExprWithPickRule_(
             rule.source_detail,
             ctx.decisionValues,
@@ -982,7 +1073,16 @@ function runKokyoRules_(ss, ctx) {
         }
 
         case 'MATCH_DECISION_EXPR': {
-          const frontValue = toNumber_(frontMap[rule.item_name]);
+          const sourceType = normalizeText_(rule.source_type || rule.document_type);
+          const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
+          if (sourceType.includes('内訳書') && hasLookupConfig) {
+            const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
+            const lookupValue = resolveBreakdownLookupValue_(ss, rule);
+            results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
+            break;
+          }
+
+          const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
           let decisionValue = resolveDecisionExprWithPickRule_(
             rule.source_detail,
             ctx.decisionValues,
@@ -1000,32 +1100,55 @@ function runKokyoRules_(ss, ctx) {
         }
 
         case 'MATCH_BREAKDOWN': {
-          results.push(makeResult_({
-            status: rule.severity || '要確認',
-            category: '概況書',
-            ruleId: rule.rule_id,
-            sheetName: CONFIG.SHEET_KOKYO_FRONT,
-            itemName: rule.item_name,
-            targetCell: '',
-            jumpUrl: '',
-            decisionValue: '',
-            compareValue: '',
-            diff: '',
-            condition: 'MATCH_BREAKDOWN',
-            message: rule.message,
-            detail: rule.source_detail || '',
-          }));
+          const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
+          if (hasLookupConfig) {
+            const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
+            const lookupValue = resolveBreakdownLookupValue_(ss, rule);
+            results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
+          } else {
+            results.push(makeResult_({
+              status: rule.severity || '要確認',
+              category: '概況書',
+              ruleId: rule.rule_id,
+              sheetName: CONFIG.SHEET_KOKYO_FRONT,
+              itemName: rule.item_name,
+              targetCell: '',
+              jumpUrl: '',
+              decisionValue: '',
+              compareValue: '',
+              diff: '',
+              condition: 'MATCH_BREAKDOWN',
+              message: rule.message,
+              detail: rule.source_detail || '',
+            }));
+          }
           break;
         }
 
         case 'MATCH_BREAKDOWN_LOOKUP': {
-          const frontValue = toNumber_(frontMap[rule.item_name]);
+          const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
           const lookupValue = resolveBreakdownLookupValue_(ss, rule);
           results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
           break;
         }
 
+        case 'MATCH_RULE_VALUE': {
+          const actual = String(getFrontMapValue_(frontMap, rule.item_name) || '').trim();
+          const expected = String(rule.source_detail || '').trim();
+          results.push(compareTextsResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, expected, actual, '概況書', '', ''));
+          break;
+        }
+
         case 'CALC_MATCH': {
+          const exprText = normalizeText_(rule.source_detail);
+          const isCellExpr = /[A-Z]+\d+/.test(exprText);
+          if (!isCellExpr) {
+            const actual = String(getFrontMapValue_(frontMap, rule.item_name) || '').trim();
+            const expected = String(rule.source_detail || '').trim();
+            results.push(compareTextsResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, expected, actual, '概況書', '', ''));
+            break;
+          }
+
           if (!backSheet) {
             results.push(makeResult_({
               status: '要確認',
@@ -1049,13 +1172,13 @@ function runKokyoRules_(ss, ctx) {
           let targetValue = null;
 
           if (rule.rule_id === 'K100') {
-            targetValue = toNumber_(frontMap['売上_収入_高_千円']);
+            targetValue = toNumber_(getFrontMapValue_(frontMap, '売上_収入_高_千円'));
           } else if (rule.rule_id === 'K101') {
-            targetValue = toNumber_(frontMap['売上_収入_原価_千円']);
+            targetValue = toNumber_(getFrontMapValue_(frontMap, '売上_収入_原価_千円'));
           } else if (rule.rule_id === 'K102') {
             targetValue =
-              (toNumber_(frontMap['販管費のうち_役員報酬_千円']) || 0) +
-              (toNumber_(frontMap['販管費のうち_従業員給料_千円']) || 0);
+              (toNumber_(getFrontMapValue_(frontMap, '販管費のうち_役員報酬_千円')) || 0) +
+              (toNumber_(getFrontMapValue_(frontMap, '販管費のうち_従業員給料_千円')) || 0);
           }
 
           results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_BACK, rule.item_name, targetValue, calcValue, '概況書', '', ''));
@@ -1063,6 +1186,9 @@ function runKokyoRules_(ss, ctx) {
         }
 
         default:
+          const debugMsg = checkType
+            ? `未対応のcheck_typeです: ${checkType}`
+            : `check_type が空です: row=${rule.__row_index || '?'} header_row=${rule.__header_row || '?'} rule_id=${rule.rule_id || ''} item=${rule.item_name || ''} raw=${rule.__raw_first || ''}（rules_kokyoの列ずれ・1セルTSV貼付の可能性）`;
           results.push(makeResult_({
             status: '要確認',
             category: '概況書',
@@ -1074,8 +1200,8 @@ function runKokyoRules_(ss, ctx) {
             decisionValue: '',
             compareValue: '',
             diff: '',
-            condition: rule.check_type,
-            message: `未対応のcheck_typeです: ${rule.check_type}`,
+            condition: checkType || '',
+            message: debugMsg,
             detail: '',
           }));
       }
@@ -1102,20 +1228,26 @@ function runKokyoRules_(ss, ctx) {
 }
 
 function resolveBreakdownLookupValue_(ss, rule) {
-  const nameSourceSheet = findTargetSheetByPattern_(ss, rule.lookup_name_source);
-  if (!nameSourceSheet) return null;
-
-  const nameCell = String(rule.lookup_name_cell || '').trim();
   let representativeName = '';
-  if (nameCell) {
-    representativeName = normalizeText_(nameSourceSheet.getRange(nameCell).getDisplayValue());
+  const nameSourcePattern = normalizeText_(rule.lookup_name_source);
+  if (nameSourcePattern) {
+    const nameSourceSheet = findTargetSheetByPattern_(ss, rule.lookup_name_source);
+    if (!nameSourceSheet) return null;
+
+    const nameCell = String(rule.lookup_name_cell || '').trim();
+    if (nameCell) {
+      representativeName = normalizeText_(nameSourceSheet.getRange(nameCell).getDisplayValue());
+    }
   }
 
   const targetSheet = findTargetSheetByPattern_(ss, rule.lookup_sheet_pattern || rule.source_detail);
   if (!targetSheet) return null;
 
   const values = targetSheet.getDataRange().getDisplayValues();
-  const matchCol = colToIndex_(rule.lookup_match_col);
+  let matchCol = colToIndex_(rule.lookup_match_col);
+  if (matchCol < 0) {
+    matchCol = a1ColToIndex_(rule.lookup_name_cell);
+  }
   const matchMode = rule.account_match_mode || 'contains';
 
   if (matchCol < 0) return null;
@@ -1130,6 +1262,12 @@ function resolveBreakdownLookupValue_(ss, rule) {
   }
 
   return null;
+}
+
+function a1ColToIndex_(a1) {
+  const m = String(a1 || '').trim().match(/^([A-Z]+)\d+$/i);
+  if (!m) return -1;
+  return colToIndex_(m[1]);
 }
 
 function isMatchByMode_(cellText, targetText, mode) {
@@ -1303,61 +1441,80 @@ function runGlobalInputAnomalyChecks_(ss) {
     CONFIG.SHEET_GROUP_MASTER,
     CONFIG.SHEET_NORMALIZE_MASTER,
     CONFIG.SHEET_EXCLUDE_MASTER,
+    CONFIG.SHEET_AI_TARGETS,
     CONFIG.SHEET_RESULT,
     CONFIG.SHEET_LOG,
     CONFIG.SHEET_REPORT
   ]);
 
   const aiCache = {};
+  const aiTargets = loadAiCheckTargets_(ss);
+  const hasTargetConfig = Object.keys(aiTargets).length > 0;
 
   ss.getSheets().forEach(sheet => {
     const sheetName = sheet.getName();
     if (ignoreSheets.has(sheetName)) return;
-    if (!normalizeText_(sheetName).includes('の内訳')) return;
+
+    const targets = resolveAiTargetsForSheet_(aiTargets, sheetName);
+    if (hasTargetConfig) {
+      if (!targets.length) return;
+    } else {
+      if (!normalizeText_(sheetName).includes('の内訳')) return;
+    }
 
     const values = sheet.getDataRange().getDisplayValues();
-    const startCol = 2;
-    const endCol = 21;
+    const ranges = hasTargetConfig
+      ? targets.filter(t => t.enabled)
+      : [{ startCol: 2, endCol: 21 }];
+    if (hasTargetConfig && ranges.length === 0) return;
+    const visited = new Set();
 
-    for (let r = 0; r < values.length; r++) {
-      for (let c = startCol - 1; c <= endCol - 1; c++) {
-        const raw = values[r][c];
-        const text = String(raw || '').trim();
-        if (!text) continue;
-        if (/^[0-9,\.\-△()\/年月日円千百]+$/.test(text)) continue;
-        if (text.length <= 1) continue;
+    for (const range of ranges) {
+      for (let r = CONFIG.AI_CHECK_START_ROW - 1; r < values.length; r++) {
+        for (let c = range.startCol - 1; c <= range.endCol - 1; c++) {
+          const cellKey = `${r}:${c}`;
+          if (visited.has(cellKey)) continue;
+          visited.add(cellKey);
 
-        let ai = aiCache[text];
-        if (!ai) {
-          ai = callGeminiBreakdownCheckSafe_(text, sheetName);
-          aiCache[text] = ai;
-          Utilities.sleep(120);
+          const raw = values[r][c];
+          const text = String(raw || '').trim();
+          if (!text) continue;
+          if (/^[0-9,\.\-△()\/年月日円千百]+$/.test(text)) continue;
+          if (text.length <= 1) continue;
+
+          let ai = aiCache[text];
+          if (!ai) {
+            ai = callGeminiBreakdownCheckSafe_(text, sheetName);
+            aiCache[text] = ai;
+            Utilities.sleep(120);
+          }
+
+          if (!ai || !ai.is_suspicious) continue;
+          if (!shouldKeepAiFinding_(text, ai)) continue;
+
+          const a1 = toA1_(r + 1, c + 1);
+          const jumpUrl = buildRangeUrl_(ss, sheetName, a1);
+
+          results.push(makeResult_({
+            status: '要確認',
+            category: '入力値チェック',
+            ruleId: 'AI001',
+            sheetName: sheetName,
+            itemName: `${a1}: ${text}`,
+            targetCell: a1,
+            jumpUrl: jumpUrl,
+            decisionValue: '',
+            compareValue: text,
+            diff: '',
+            condition: 'BREAKDOWN_TEXT_GEMINI_CHECK',
+            message: ai.reason || '不自然な入力の可能性があります',
+            detail: '',
+            aiJudge: ai.is_suspicious ? '不自然' : '問題なし',
+            aiReason: ai.reason || '',
+            aiSuggestion1: ai.suggestions && ai.suggestions[0] ? ai.suggestions[0] : '',
+            aiSuggestion2: ai.suggestions && ai.suggestions[1] ? ai.suggestions[1] : '',
+          }));
         }
-
-        if (!ai || !ai.is_suspicious) continue;
-
-        const a1 = toA1_(r + 1, c + 1);
-        const jumpUrl = buildRangeUrl_(ss, sheetName, a1);
-
-        results.push(makeResult_({
-          status: '要確認',
-          category: '入力値チェック',
-          ruleId: 'AI001',
-          sheetName: sheetName,
-          itemName: `${a1}: ${text}`,
-          targetCell: a1,
-          jumpUrl: jumpUrl,
-          decisionValue: '',
-          compareValue: text,
-          diff: '',
-          condition: 'BREAKDOWN_TEXT_GEMINI_CHECK',
-          message: ai.reason || '不自然な入力の可能性があります',
-          detail: '',
-          aiJudge: ai.is_suspicious ? '不自然' : '問題なし',
-          aiReason: ai.reason || '',
-          aiSuggestion1: ai.suggestions && ai.suggestions[0] ? ai.suggestions[0] : '',
-          aiSuggestion2: ai.suggestions && ai.suggestions[1] ? ai.suggestions[1] : '',
-        }));
       }
     }
   });
@@ -1365,13 +1522,88 @@ function runGlobalInputAnomalyChecks_(ss) {
   return results;
 }
 
-function callGemini_(text) {
-  const props = PropertiesService.getScriptProperties();
+function resolveAiTargetsForSheet_(aiTargets, sheetName) {
+  const out = [];
+  const seenKeys = new Set();
+  const normSheet = normalizeText_(sheetName);
 
-  const apiKey = props.getProperty("GEMINI_API_KEY");
-  const model =
-    props.getProperty("GEMINI_MODEL") ||
-    "gemini-3.1-pro-preview";
+  if (aiTargets[sheetName]) {
+    out.push(...aiTargets[sheetName]);
+    seenKeys.add(sheetName);
+  }
+
+  Object.keys(aiTargets).forEach(k => {
+    if (seenKeys.has(k)) return;
+    const normKey = normalizeText_(k);
+    if (!normKey) return;
+    if (normSheet.includes(normKey)) {
+      out.push(...aiTargets[k]);
+    }
+  });
+
+  return out;
+}
+
+function loadAiCheckTargets_(ss) {
+  const sheet = ss.getSheetByName(CONFIG.SHEET_AI_TARGETS);
+  if (!sheet) return {};
+
+  const rows = loadRowsAsObjects_(sheet);
+  const map = {};
+
+  rows.forEach(r => {
+    const sheetName = String(r.sheet_name || r.sheetname || r['sheet name'] || '').trim();
+    if (!sheetName) return;
+
+    const enabled = String(r.enabled == null ? 'TRUE' : r.enabled).trim().toUpperCase();
+    const startCol = parseColRefTo1Based_(r.start_col || r.startcol || r['start col']) || 2;
+    const endCol = parseColRefTo1Based_(r.end_col || r.endcol || r['end col']) || 21;
+
+    if (!map[sheetName]) map[sheetName] = [];
+    map[sheetName].push({
+      enabled: enabled !== 'FALSE' && enabled !== '0' && enabled !== 'NO',
+      startCol: Math.max(1, Math.min(startCol, endCol)),
+      endCol: Math.max(startCol, endCol)
+    });
+  });
+
+  return map;
+}
+
+function parseColRefTo1Based_(v) {
+  const s = String(v || '').trim().toUpperCase();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return Number(s);
+  const idx = colToIndex_(s);
+  return idx >= 0 ? idx + 1 : null;
+}
+
+function shouldKeepAiFinding_(text, ai) {
+  const t = String(text || '').trim();
+  const reason = String((ai && ai.reason) || '');
+  const norm = normalizeText_(t);
+
+  if (!t) return false;
+
+  // 今回は「明らかな誤入力」を中心に拾うため、業務上許容される語は除外
+  if (/^(登録番号|売掛金|買掛金|仮払金|仮受金|本人|該当|該当なし)$/u.test(norm)) return false;
+  if (/^T\d{13}$/i.test(norm)) return false; // インボイス登録番号
+  if (/^(令和|平成|昭和)\d+年\d+月\d+日$/u.test(norm)) return false;
+  if (/^\d+[-‐－~～]\d+月/.test(norm)) return false; // 例: 1-2月利用分
+
+  const hasClearTypoSignal =
+    /(誤字|脱字|文字化け|重複|欠落|誤入力|入力ミス|途切れ|存在しません)/u.test(reason) ||
+    /(.)\1/u.test(norm); // 例: 北沢沢
+
+  // 全角英字だけの一般語（例: Ｌａｂｏｒａｔｏｒｙ）も残す
+  const fullWidthAlphaOnly = /^[Ａ-Ｚａ-ｚ]+$/u.test(norm);
+
+  return hasClearTypoSignal || fullWidthAlphaOnly;
+}
+
+function callGemini_(text) {
+  const apiKey = getGeminiApiKey_();
+  const model = getGeminiModel_();
 
   if (!apiKey) {
     return "Geminiキー未設定";
@@ -1416,6 +1648,15 @@ function callGemini_(text) {
   return json.candidates?.[0]?.content?.parts?.[0]?.text || "応答なし";
 }
 
+function getGeminiApiKey_() {
+  return PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY') || '';
+}
+
+function getGeminiModel_() {
+  const raw = PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || 'gemini-2.5-flash';
+  return String(raw).replace(/^models\//, '');
+}
+
 function callGeminiBreakdownCheck_(text, sheetName) {
   const apiKey = getGeminiApiKey_();
   if (!apiKey) {
@@ -1426,7 +1667,8 @@ function callGeminiBreakdownCheck_(text, sheetName) {
     };
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  const model = getGeminiModel_();
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const prompt = `
 あなたは税務申告書の内訳書チェック支援AIです。
@@ -1497,6 +1739,18 @@ function callGeminiBreakdownCheck_(text, sheetName) {
     reason: parsed.reason || '',
     suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions.slice(0, 2) : []
   };
+}
+
+function callGeminiBreakdownCheckSafe_(text, sheetName) {
+  try {
+    return callGeminiBreakdownCheck_(text, sheetName);
+  } catch (e) {
+    return {
+      is_suspicious: true,
+      reason: `Gemini判定エラー: ${e && e.message ? e.message : String(e)}`,
+      suggestions: []
+    };
+  }
 }
 
 /* =========================
@@ -1595,10 +1849,11 @@ function parseDecisionSheet_(sheet) {
   for (let r = 0; r < values.length; r++) {
     const colA = normalizeText_(values[r][0]);
     const colB = values[r][1];
+    const colC = values[r][2];
     const colD = values[r][3];
 
     const key = colA;
-    const amount = toNumber_(colB) != null ? toNumber_(colB) : toNumber_(colD);
+    const amount = pickDecisionAmount_(colB, colC, colD);
 
     if (!key) continue;
 
@@ -1630,6 +1885,14 @@ function parseDecisionSheet_(sheet) {
     map,
     bsAccounts: [...new Set(bsAccounts)],
   };
+}
+
+function pickDecisionAmount_(colB, colC, colD) {
+  const c = toNumber_(colC);
+  if (c != null) return c;
+  const b = toNumber_(colB);
+  if (b != null) return b;
+  return toNumber_(colD);
 }
 
 function isRealBSAccount_(key) {
@@ -1667,7 +1930,60 @@ function loadRulesMain_(ss) {
 }
 
 function loadRulesKokyo_(ss) {
-  return loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_RULES_KOKYO));
+  const sheet = getRequiredSheet_(ss, CONFIG.SHEET_RULES_KOKYO);
+  const { displayValues } = getSheetValues_(sheet);
+  if (displayValues.length < 2) return [];
+
+  const headerRow = detectHeaderRow_(displayValues);
+  const headerKeys = new Set(displayValues[headerRow].map(v => normalizeText_(v).toLowerCase()));
+  const hasHeader =
+    (headerKeys.has('rule_id') || headerKeys.has('ruleid')) &&
+    (headerKeys.has('check_type') || headerKeys.has('checktype'));
+  if (hasHeader) return loadRowsAsObjects_(sheet);
+
+  return parseRulesKokyoByPosition_(displayValues);
+}
+
+function parseRulesKokyoByPosition_(displayValues) {
+  const out = [];
+  for (let r = 0; r < displayValues.length; r++) {
+    let row = displayValues[r];
+    if (!row || row.join('').trim() === '') continue;
+
+    // 1セルにTSV形式で入っているケースを救済
+    if (
+      row.length > 0 &&
+      String(row[0] || '').includes('\t') &&
+      row.slice(1).every(v => String(v || '').trim() === '')
+    ) {
+      row = String(row[0]).split('\t');
+    }
+
+    const idMatch = String(row[0] || '').match(/K\d{3}/);
+    if (!idMatch) continue;
+
+    out.push({
+      rule_id: idMatch[0],
+      enabled: row[1],
+      item_name: row[2],
+      check_type: row[3],
+      document_type: row[4],
+      source_detail: row[5],
+      value_pick_rule: row[6],
+      account_match_mode: row[7],
+      lookup_sheet_pattern: row[8],
+      lookup_name_source: row[9],
+      lookup_name_cell: row[10],
+      lookup_match_col: row[11],
+      lookup_value_col: row[12],
+      condition: row[13],
+      severity: row[14],
+      message: row[15],
+      __row_index: r + 1,
+      __raw_first: String(row[0] || '')
+    });
+  }
+  return out;
 }
 
 function loadGroupMaster_(ss) {
@@ -1784,18 +2100,39 @@ function loadRowsAsObjects_(sheet) {
   const { displayValues } = getSheetValues_(sheet);
   if (displayValues.length < 2) return [];
 
-  const headers = displayValues[0].map(h => normalizeText_(h));
+  const headerRow = detectHeaderRow_(displayValues);
+  const headers = displayValues[headerRow].map(h => normalizeText_(h));
   const rows = [];
 
-  for (let r = 1; r < displayValues.length; r++) {
+  for (let r = headerRow + 1; r < displayValues.length; r++) {
     const row = displayValues[r];
     if (row.join('').trim() === '') continue;
 
     const obj = {};
     headers.forEach((h, i) => obj[h] = row[i]);
+    obj.__row_index = r + 1;
+    obj.__header_row = headerRow + 1;
+    obj.__raw_first = String(row[0] || '');
     rows.push(obj);
   }
   return rows;
+}
+
+function detectHeaderRow_(displayValues) {
+  const limit = Math.min(displayValues.length, 20);
+  for (let r = 0; r < limit; r++) {
+    const keys = new Set(displayValues[r].map(v => normalizeText_(v).toLowerCase()));
+    const hasRuleId = keys.has('rule_id') || keys.has('ruleid');
+    const hasCheckType =
+      keys.has('check_type') ||
+      keys.has('checktype');
+    const hasItemName = keys.has('item_name') || keys.has('itemname');
+
+    if (hasRuleId && (hasCheckType || hasItemName)) {
+      return r;
+    }
+  }
+  return 0;
 }
 
 function getSheetValues_(sheet) {
@@ -1827,6 +2164,44 @@ function findTargetSheetByPattern_(ss, pattern) {
   return null;
 }
 
+function findSheetByFlexibleName_(ss, baseName) {
+  const exact = ss.getSheetByName(baseName);
+  if (exact) return exact;
+
+  const target = normalizeText_(baseName);
+  if (!target) return null;
+
+  const sheets = ss.getSheets();
+  for (const sh of sheets) {
+    const name = normalizeText_(sh.getName());
+    if (name.endsWith(target)) return sh; // 例: 260411_概況書表面
+  }
+  for (const sh of sheets) {
+    const name = normalizeText_(sh.getName());
+    if (name.includes(target)) return sh;
+  }
+  return null;
+}
+
+function findKokyoFrontSheet_(ss) {
+  return (
+    findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_FRONT) ||
+    findTargetSheetByPattern_(ss, '法人事業概況説明書(表面)固定項目') ||
+    findTargetSheetByPattern_(ss, '法人事業概況説明書(表面)')
+  );
+}
+
+function findKokyoBackSheet_(ss) {
+  // 裏面は「月別の売上高等の状況」を最優先で使用（D19/E19 等の計算で使うため）
+  return (
+    findTargetSheetByPattern_(ss, '月別の売上高等の状況') ||
+    findTargetSheetByPattern_(ss, '法人事業概況説明書(裏面)月別の売上高等の状況') ||
+    findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_BACK) ||
+    findTargetSheetByPattern_(ss, '法人事業概況説明書(裏面)固定項目') ||
+    findTargetSheetByPattern_(ss, '法人事業概況説明書(裏面)')
+  );
+}
+
 function parseKeyValueSheet_(sheet) {
   const { displayValues } = getSheetValues_(sheet);
   const map = {};
@@ -1838,6 +2213,10 @@ function parseKeyValueSheet_(sheet) {
     map[key] = value;
   }
   return map;
+}
+
+function getFrontMapValue_(frontMap, key) {
+  return frontMap[normalizeText_(key)] || '';
 }
 
 function evaluateConditionAgainstDecision_(condition, ctx) {
@@ -2015,6 +2394,46 @@ function compareNumbersResult_(rule, sheetName, itemName, decisionValue, compare
   });
 }
 
+function compareTextsResult_(rule, sheetName, itemName, expectedValue, actualValue, category, targetCell, jumpUrl) {
+  const expected = String(expectedValue || '').trim();
+  const actual = String(actualValue || '').trim();
+
+  if (!expected) {
+    return makeResult_({
+      status: 'SKIP',
+      category: category || '概況書',
+      ruleId: rule.rule_id,
+      sheetName,
+      itemName,
+      targetCell: targetCell || '',
+      jumpUrl: jumpUrl || '',
+      decisionValue: '',
+      compareValue: actual,
+      diff: '',
+      condition: '期待値未設定',
+      message: 'rules_kokyo の source_detail に期待値を設定してください',
+      detail: '',
+    });
+  }
+
+  const ok = normalizeText_(expected) === normalizeText_(actual);
+  return makeResult_({
+    status: ok ? 'OK' : (rule.severity || 'NG'),
+    category: category || '概況書',
+    ruleId: rule.rule_id,
+    sheetName,
+    itemName,
+    targetCell: targetCell || '',
+    jumpUrl: jumpUrl || '',
+    decisionValue: expected,
+    compareValue: actual,
+    diff: '',
+    condition: rule.check_type || '',
+    message: ok ? 'OK' : rule.message,
+    detail: '',
+  });
+}
+
 function ngHeaderNotFound_(rule, sheet) {
   return makeResult_({
     status: rule.severity || 'NG',
@@ -2086,6 +2505,24 @@ function normalizeText_(v) {
     .replace(/\s/g, '')
     .replace(/[　]/g, '')
     .trim();
+}
+
+function normalizeCheckType_(v) {
+  const t = String(v || '').trim().toUpperCase();
+  if (!t) return '';
+
+  const aliasMap = {
+    'NOTBLANK': 'NOT_BLANK',
+    'CONDITIONALNOTBLANK': 'CONDITIONAL_NOT_BLANK',
+    'MATCHDECISION': 'MATCH_DECISION',
+    'MATCHDECISIONEXPR': 'MATCH_DECISION_EXPR',
+    'MATCHBREAKDOWN': 'MATCH_BREAKDOWN',
+    'MATCHBREAKDOWNLOOKUP': 'MATCH_BREAKDOWN_LOOKUP',
+    'MATCHRULEVALUE': 'MATCH_RULE_VALUE',
+    'CALCMATCH': 'CALC_MATCH',
+    'NOTBLANKWHENROWEXISTS': 'NOT_BLANK_WHEN_ROW_EXISTS',
+  };
+  return aliasMap[t.replace(/[_\-\s]/g, '')] || t;
 }
 
 function isBlank_(v) {
