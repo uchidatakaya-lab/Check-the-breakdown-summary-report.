@@ -1724,10 +1724,11 @@ function parseDecisionSheet_(sheet) {
   for (let r = 0; r < values.length; r++) {
     const colA = normalizeText_(values[r][0]);
     const colB = values[r][1];
+    const colC = values[r][2];
     const colD = values[r][3];
 
     const key = colA;
-    const amount = toNumber_(colB) != null ? toNumber_(colB) : toNumber_(colD);
+    const amount = pickDecisionAmount_(colB, colC, colD);
 
     if (!key) continue;
 
@@ -1759,6 +1760,14 @@ function parseDecisionSheet_(sheet) {
     map,
     bsAccounts: [...new Set(bsAccounts)],
   };
+}
+
+function pickDecisionAmount_(colB, colC, colD) {
+  const c = toNumber_(colC);
+  if (c != null) return c;
+  const b = toNumber_(colB);
+  if (b != null) return b;
+  return toNumber_(colD);
 }
 
 function isRealBSAccount_(key) {
