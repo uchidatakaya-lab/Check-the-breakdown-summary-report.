@@ -990,8 +990,8 @@ function checkNormalizeSum_(rule, sheet, rows, ctx) {
 
 function runKokyoRules_(ss, ctx) {
   const results = [];
-  const frontSheet = ss.getSheetByName(CONFIG.SHEET_KOKYO_FRONT);
-  const backSheet = ss.getSheetByName(CONFIG.SHEET_KOKYO_BACK);
+  const frontSheet = findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_FRONT);
+  const backSheet = findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_BACK);
 
   const frontMap = frontSheet ? parseKeyValueSheet_(frontSheet) : {};
   const backValues = backSheet ? getSheetValues_(backSheet).values : [];
@@ -2107,6 +2107,25 @@ function findTargetSheetByPattern_(ss, pattern) {
   const sheets = ss.getSheets();
   for (const sh of sheets) {
     if (normalizeText_(sh.getName()).includes(p)) return sh;
+  }
+  return null;
+}
+
+function findSheetByFlexibleName_(ss, baseName) {
+  const exact = ss.getSheetByName(baseName);
+  if (exact) return exact;
+
+  const target = normalizeText_(baseName);
+  if (!target) return null;
+
+  const sheets = ss.getSheets();
+  for (const sh of sheets) {
+    const name = normalizeText_(sh.getName());
+    if (name.endsWith(target)) return sh; // 例: 260411_概況書表面
+  }
+  for (const sh of sheets) {
+    const name = normalizeText_(sh.getName());
+    if (name.includes(target)) return sh;
   }
   return null;
 }
