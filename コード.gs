@@ -381,6 +381,7 @@ function buildContext_(ss) {
     excludeMaster: loadExcludeMaster_(ss),
     rulesMain: loadRulesMain_(ss),
     rulesKokyo: loadRulesKokyo_(ss),
+    trackDecisionUsage: false,
   };
 }
 
@@ -452,6 +453,7 @@ function buildUnusedBSAccountResults_(ctx) {
 
 function runMainRules_(ss, ctx) {
   const results = [];
+  ctx.trackDecisionUsage = true;
 
   for (const rule of ctx.rulesMain) {
     if (!toBoolean_(rule.enabled)) continue;
@@ -548,6 +550,7 @@ function runMainRules_(ss, ctx) {
       }));
     }
   }
+  ctx.trackDecisionUsage = false;
 
   return results;
 }
@@ -999,7 +1002,9 @@ function runKokyoRules_(ss, ctx) {
   for (const rule of ctx.rulesKokyo) {
     if (!toBoolean_(rule.enabled)) continue;
     const checkType = normalizeCheckType_(rule.check_type || rule.checktype || rule['check type']);
-    const sheetNameByRule = getKokyoSheetNameByRule_(rule, frontSheetName, backFixedSheetName, backMonthlySheetName);
+    const backSheetByRule = resolveKokyoBackSheetByRule_(ss, rule, backMonthlySheet, backFixedSheet);
+    const backValuesByRule = backSheetByRule ? getSheetValues_(backSheetByRule).values : backValues;
+    const sheetNameByRule = getKokyoSheetNameByRule_(rule, frontSheetName, backFixedSheetName, backMonthlySheetName, backSheetByRule);
 
     try {
       switch (checkType) {
@@ -1050,13 +1055,13 @@ function runKokyoRules_(ss, ctx) {
           const sourceType = normalizeText_(rule.source_type || rule.document_type);
           const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
           if (sourceType.includes('内訳書') && hasLookupConfig) {
-            const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValues);
+            const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
             const lookupValue = resolveBreakdownLookupValue_(ss, rule);
             results.push(compareNumbersResult_(rule, sheetNameByRule, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
             break;
           }
 
-          const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValues);
+          const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
           let decisionValue = resolveDecisionExprWithPickRule_(
             rule.source_detail,
             ctx.decisionValues,
@@ -1077,13 +1082,13 @@ function runKokyoRules_(ss, ctx) {
           const sourceType = normalizeText_(rule.source_type || rule.document_type);
           const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
           if (sourceType.includes('内訳書') && hasLookupConfig) {
-            const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValues);
+            const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
             const lookupValue = resolveBreakdownLookupValue_(ss, rule);
             results.push(compareNumbersResult_(rule, sheetNameByRule, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
             break;
           }
 
-          const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValues);
+          const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
           let decisionValue = resolveDecisionExprWithPickRule_(
             rule.source_detail,
             ctx.decisionValues,
@@ -1103,7 +1108,7 @@ function runKokyoRules_(ss, ctx) {
         case 'MATCH_BREAKDOWN': {
           const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
           if (hasLookupConfig) {
-            const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValues);
+            const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
             const lookupValue = resolveBreakdownLookupValue_(ss, rule);
             results.push(compareNumbersResult_(rule, sheetNameByRule, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
           } else {
@@ -1127,7 +1132,7 @@ function runKokyoRules_(ss, ctx) {
         }
 
         case 'MATCH_BREAKDOWN_LOOKUP': {
-          const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValues);
+          const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
           const lookupValue = resolveBreakdownLookupValue_(ss, rule);
           results.push(compareNumbersResult_(rule, sheetNameByRule, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
           break;
@@ -1169,7 +1174,7 @@ function runKokyoRules_(ss, ctx) {
             break;
           }
 
-          const calcValue = evaluateCellExpression_(rule.source_detail, backValues);
+          const calcValue = evaluateCellExpression_(rule.source_detail, backValuesByRule);
           let targetValue = null;
 
           if (rule.rule_id === 'K100') {
@@ -2092,6 +2097,7 @@ function resolveDecisionExpression_(expr, ctx) {
 }
 
 function markDecisionAccountUsed_(ctx, accountName) {
+  if (!ctx || !ctx.trackDecisionUsage) return;
   const a = normalizeText_(accountName);
   if (!a) return;
   ctx.usedDecisionAccounts.add(a);
@@ -2236,11 +2242,25 @@ function getKokyoSourceType_(rule) {
   return normalizeText_(rule.source_type || rule.document_type || '概況書');
 }
 
-function getKokyoSheetNameByRule_(rule, frontSheetName, backFixedSheetName, backMonthlySheetName) {
+function getKokyoSheetNameByRule_(rule, frontSheetName, backFixedSheetName, backMonthlySheetName, backSheetByRule) {
   if (!getKokyoSourceType_(rule).includes('裏面')) return frontSheetName;
-  const cellExpr = normalizeText_(rule.lookup_value_col);
+  if (backSheetByRule) return backSheetByRule.getName();
+  const cellExpr = normalizeText_(getKokyoLookupExpr_(rule));
   if (cellExpr && isKokyoMonthlyExpr_(cellExpr) && backMonthlySheetName) return backMonthlySheetName;
   return backFixedSheetName;
+}
+
+function resolveKokyoBackSheetByRule_(ss, rule, defaultBackMonthlySheet, defaultBackFixedSheet) {
+  if (!getKokyoSourceType_(rule).includes('裏面')) return null;
+  const explicitPattern = normalizeText_(rule.compare_sheet_pattern || rule.lookup_sheet_pattern);
+  if (explicitPattern) {
+    return findTargetSheetByPattern_(ss, explicitPattern) || defaultBackMonthlySheet || defaultBackFixedSheet || null;
+  }
+  const cellExpr = normalizeText_(getKokyoLookupExpr_(rule));
+  if (cellExpr && isKokyoMonthlyExpr_(cellExpr)) {
+    return defaultBackMonthlySheet || defaultBackFixedSheet || null;
+  }
+  return defaultBackFixedSheet || defaultBackMonthlySheet || null;
 }
 
 function getKokyoValueByRule_(rule, frontMap, backMap) {
@@ -2250,12 +2270,20 @@ function getKokyoValueByRule_(rule, frontMap, backMap) {
 }
 
 function resolveKokyoActualNumber_(rule, frontMap, backMap, backValues) {
-  const cellExpr = normalizeText_(rule.lookup_value_col);
+  const cellExpr = normalizeText_(getKokyoLookupExpr_(rule));
   if (getKokyoSourceType_(rule).includes('裏面') && cellExpr && isKokyoMonthlyExpr_(cellExpr) && Array.isArray(backValues) && backValues.length) {
     const monthlyExpr = toMonthlyExprWithTotalRow_(cellExpr, backValues);
     return toNumber_(evaluateCellExpression_(monthlyExpr, backValues));
   }
   return toNumber_(getKokyoValueByRule_(rule, frontMap, backMap));
+}
+
+function getKokyoLookupExpr_(rule) {
+  const primary = normalizeText_(rule.lookup_value_col);
+  if (primary) return primary;
+  const fallback = normalizeText_(rule.lookup_match_col);
+  if (fallback && isKokyoMonthlyExpr_(fallback)) return fallback;
+  return '';
 }
 
 function isKokyoMonthlyExpr_(text) {
