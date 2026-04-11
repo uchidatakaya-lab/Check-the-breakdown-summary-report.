@@ -280,8 +280,9 @@ function runChecksCore_(ss) {
     const mainResults = runMainRules_(ss, ctx);
     const kokyoResults = runKokyoRules_(ss, ctx);
     const typoResults = runGlobalInputAnomalyChecks_(ss);
+    const bsUnusedResults = buildUnusedBSAccountResults_(ctx);
 
-    const allResults = [...mainResults, ...kokyoResults, ...typoResults];
+    const allResults = [...mainResults, ...kokyoResults, ...typoResults, ...bsUnusedResults];
     writeResults_(ss, allResults);
     buildA4Report_(ss);
 
@@ -293,6 +294,70 @@ function runChecksCore_(ss) {
     const sec = Math.round((new Date() - startedAt) / 1000);
     appendLogRow_(ss, `処理時間 ${sec} 秒`);
   }
+}
+
+function buildUnusedBSAccountResults_(ctx) {
+  const results = [];
+
+  const excluded = new Set([
+    '現金及び預金',
+    '売掛金',
+    '買掛金',
+    '未払金',
+    '未払費用',
+    '長期借入金',
+    '短期借入金',
+    '役員借入金',
+    '貸付金',
+    '短期貸付金',
+    '長期貸付金',
+    '土地',
+    '建物',
+    '機械装置',
+    '車両',
+    '車両運搬具',
+    '商品',
+    '製品',
+    '半製品',
+    '仕掛品',
+    '原材料',
+    '貯蔵品',
+    '有価証券',
+    '出資金',
+    '預託金',
+    '仮払金',
+    '仮受金',
+    '受取手形',
+    '支払手形'
+  ]);
+
+  ctx.bsAccounts.forEach(account => {
+    const a = normalizeText_(account);
+    if (!a) return;
+
+    // 今回は主要科目だけ対象。対象外は出さない
+    if (!excluded.has(a)) return;
+
+    if (!ctx.usedDecisionAccounts.has(a)) {
+      results.push(makeResult_({
+        status: '要確認',
+        category: '未照合BS科目',
+        ruleId: 'BS001',
+        sheetName: CONFIG.SHEET_DECISION,
+        itemName: a,
+        targetCell: '',
+        jumpUrl: '',
+        decisionValue: ctx.decisionMap[a] || '',
+        compareValue: '',
+        diff: '',
+        condition: 'UNUSED_BS_ACCOUNT',
+        message: '決算書のBS科目ですが、今回どの内訳書照合にも使用されていません',
+        detail: '',
+      }));
+    }
+  });
+
+  return results;
 }
 
 function resetResultSheets() {
@@ -333,11 +398,13 @@ function resetResultSheetsInSpreadsheet_(ss) {
 
 function buildContext_(ss) {
   const decisionSheet = getRequiredSheet_(ss, CONFIG.SHEET_DECISION);
-  const decisionMap = parseDecisionSheet_(decisionSheet);
+  const parsed = parseDecisionSheet_(decisionSheet);
 
   return {
     ss,
-    decisionMap,
+    decisionMap: parsed.map,
+    bsAccounts: parsed.bsAccounts,
+    usedDecisionAccounts: new Set(),
     groups: loadGroupMaster_(ss),
     normalizeRules: loadNormalizeMaster_(ss),
     excludeMaster: loadExcludeMaster_(ss),
@@ -1228,7 +1295,7 @@ function buildA4Report_(ss) {
 
   if (report.getFilter()) report.getFilter().remove();
   report.getDataRange().createFilter();
-  report.hideGridlines(true);
+   report.setHiddenGridlines(true);
 }
 
 /* =========================
@@ -1238,8 +1305,11 @@ function buildA4Report_(ss) {
 function parseDecisionSheet_(sheet) {
   const { values } = getSheetValues_(sheet);
   const map = {};
+  const bsAccounts = [];
 
   let section = '';
+  let inBS = false;
+
   for (let r = 0; r < values.length; r++) {
     const colA = normalizeText_(values[r][0]);
     const colB = values[r][1];
@@ -1250,8 +1320,15 @@ function parseDecisionSheet_(sheet) {
 
     if (!key) continue;
 
-    if (key.includes('資産の部') || key.includes('負債の部') || key.includes('純資産の部')) {
-      section = key;
+    if (key.includes('資産の部')) {
+      section = '資産の部';
+      inBS = true;
+    } else if (key.includes('負債の部')) {
+      section = '負債の部';
+      inBS = true;
+    } else if (key.includes('純資産の部')) {
+      section = '純資産の部';
+      inBS = false;
     }
 
     if (amount != null) {
@@ -1261,10 +1338,68 @@ function parseDecisionSheet_(sheet) {
     if (section && amount != null && key && !key.includes('の部')) {
       map[`${section}:${key}`] = amount;
     }
+
+    if (inBS && amount != null && isRealBSAccount_(key)) {
+      bsAccounts.push(key);
+    }
   }
 
-  return map;
+  return {
+    map,
+    bsAccounts: [...new Set(bsAccounts)],
+  };
 }
+
+function isRealBSAccount_(key) {
+  const k = normalizeText_(key);
+  if (!k) return false;
+
+  const excludes = new Set([
+    '資産の部合計',
+    '負債の部合計',
+    '純資産の部合計',
+    '流動資産',
+    '固定資産',
+    '繰延資産',
+    '流動負債',
+    '固定負債',
+    '株主資本',
+    '資本金',
+    '利益剰余金',
+    'その他利益剰余金',
+    '繰越利益剰余金',
+    '評価・換算差額等',
+    '新株予約権'
+  ]);
+
+  if (excludes.has(k)) return false;
+  if (k.startsWith('【') && k.endsWith('】')) return false;
+  if (k.includes('合計')) return false;
+  if (k.includes('うち')) return false;
+
+  return true;
+}
+
+function markDecisionAccountUsed_(ctx, accountName) {
+  const a = normalizeText_(accountName);
+  if (!a) return;
+  ctx.usedDecisionAccounts.add(a);
+}
+
+function markDecisionExpressionUsed_(ctx, expr) {
+  const text = normalizeText_(expr);
+  if (!text) return;
+
+  const parts = text.split('+').map(s => normalizeText_(s)).filter(Boolean);
+  parts.forEach(part => {
+    if (ctx.groups[part]) {
+      ctx.groups[part].forEach(acc => markDecisionAccountUsed_(ctx, acc));
+    } else {
+      markDecisionAccountUsed_(ctx, part);
+    }
+  });
+}
+
 
 /* =========================
  * ルール・マスタ読込
@@ -1316,12 +1451,14 @@ function loadExcludeMaster_(ss) {
 
 function resolveDecisionTargetValue_(rule, ctx) {
   if (normalizeText_(rule.target_account)) {
+    markDecisionExpressionUsed_(ctx, rule.target_account);
     return resolveDecisionExpression_(rule.target_account, ctx);
   }
   if (normalizeText_(rule.target_account_group)) {
     const groupName = normalizeText_(rule.target_account_group);
     const accounts = ctx.groups[groupName] || [];
     const filtered = accounts.filter(a => ctx.decisionMap[a] != null);
+    filtered.forEach(a => markDecisionAccountUsed_(ctx, a));
     if (filtered.length === 0) return null;
     return filtered.reduce((sum, a) => sum + (ctx.decisionMap[a] || 0), 0);
   }
@@ -1341,11 +1478,13 @@ function resolveDecisionExpression_(expr, ctx) {
       const groupAccounts = ctx.groups[part].filter(acc => ctx.decisionMap[acc] != null);
       if (groupAccounts.length === 0) return sum;
       foundAny = true;
+      groupAccounts.forEach(acc => markDecisionAccountUsed_(ctx, acc));
       return sum + groupAccounts.reduce((s, acc) => s + (ctx.decisionMap[acc] || 0), 0);
     }
 
     if (ctx.decisionMap[part] != null) {
       foundAny = true;
+      markDecisionAccountUsed_(ctx, part);
       return sum + (ctx.decisionMap[part] || 0);
     }
 
