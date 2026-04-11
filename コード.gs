@@ -1499,6 +1499,18 @@ function callGeminiBreakdownCheck_(text, sheetName) {
   };
 }
 
+function callGeminiBreakdownCheckSafe_(text, sheetName) {
+  try {
+    return callGeminiBreakdownCheck_(text, sheetName);
+  } catch (e) {
+    return {
+      is_suspicious: true,
+      reason: `Gemini判定エラー: ${e && e.message ? e.message : String(e)}`,
+      suggestions: []
+    };
+  }
+}
+
 /* =========================
  * report_A4
  * ========================= */
