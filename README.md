@@ -1,1 +1,62 @@
 # Check-the-breakdown-summary-report.
+
+## rules_main でヘッダー検出を通すための設定ガイド（役員給与等の内訳）
+
+このプロジェクトの `GROUP_SUM` は、まず `amount_col` 列の中から `header_name` を探し、見つからない場合はシート全体から `header_name` の一致セルを探す実装です。  
+そのため、`rules_main` は「`header_name` と実シートの文字列が一致していること」が最重要です。
+
+### 1) 実装上の検出ロジックの要点
+
+- 文字比較は `normalizeText_()` で実施（空白・改行は除去）。  
+  例: `定期同額給与` と `定期同額給与 ` は一致扱い。
+- `GROUP_SUM` では以下の順でヘッダー検出:
+  1. `amount_col` 列内で `header_name` を縦検索
+  2. 見つからなければ、シート全体で `header_name` を検索
+- どちらでも見つからなければ `ヘッダー未検出`。
+
+### 2) 現在のサンプルで NG になる主因
+
+貼っていただいた「役員給与等の内訳」シートでは、見出し行が次の構成です。
+
+- `定期同額給与`
+- `事前確定届出給与`
+- `退職給与`
+- `常勤_非常勤の別`
+
+この見出しが「結合セル・図形テキスト・別文字（例: 全角/半角の記号差）」になっていると、値として読めず未検出になります。  
+特に `R030〜R032` は `amount_col` に `K/L/O` を指定しているため、該当列の見出しセルに文字列が存在している必要があります。
+
+### 3) 推奨する rules_main の書き方（R030〜R033）
+
+`rules_main` のヘッダー行（1 行目）は以下の列名をそのまま使用してください。
+
+`rule_id, enabled, document_type, file_pattern, check_type, account_col, amount_col, header_name, aggregation_type, account_mapping, target_account, target_account_group, exclude_accounts, condition, severity, message`
+
+役員給与等の内訳向けの例:
+
+| rule_id | enabled | document_type | file_pattern | check_type | amount_col | header_name | target_account_group | severity | message |
+|---|---|---|---|---|---|---|---|---|---|
+| R030 | TRUE | 役員給与 | 役員給与等の内訳 | GROUP_SUM | K | 定期同額給与 | 役員給与 | NG | K列合計が決算書の役員報酬と一致しません |
+| R031 | TRUE | 役員給与 | 役員給与等の内訳 | GROUP_SUM | L | 事前確定届出給与 | 役員賞与 | NG | L列合計が決算書の役員賞与と一致しません |
+| R032 | TRUE | 役員給与 | 役員給与等の内訳 | GROUP_SUM | O | 退職給与 | 役員退職金 | NG | O列合計が決算書の役員退職金と一致しません |
+| R033 | TRUE | 役員給与 | 役員給与等の内訳 | HEADER_CHECK |  | 常勤_非常勤の別 |  | 要確認 | 常勤_非常勤の別 が見つかりません |
+
+補足:
+
+- `HEADER_CHECK` は存在確認のみのため `amount_col` は空欄で OK。
+- `file_pattern` はシート名に含まれる文字列で一致判定されるため、シート名に `役員給与等の内訳` を含める。
+- `target_account_group` は `group_master` 側のグループ名と一致させる。
+
+### 4) 実シート側の配置ルール（重要）
+
+- 見出しは「セルの値」として入力（結合セル・図形テキストは避ける）。
+- `K/L/O` 列の見出しセルそのものに、`header_name` と同一文字列を置く。
+- 表示文字に余計な記号を付けない（例: `定期同額給与（円）` にしない）。
+- シート名は `file_pattern` が部分一致できる名称にする。
+
+### 5) まず実施すべき確認チェック
+
+1. 対象シート名に `役員給与等の内訳` が含まれているか。  
+2. 見出し行の `K/L/O` セルが、それぞれ `定期同額給与/事前確定届出給与/退職給与` になっているか。  
+3. `常勤_非常勤の別` がセル値として存在するか（図形上の文字でないか）。  
+4. `rules_main` の `header_name` と見出し文字列が完全一致しているか。  
