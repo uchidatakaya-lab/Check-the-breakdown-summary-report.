@@ -1082,21 +1082,28 @@ function runKokyoRules_(ss, ctx) {
         }
 
         case 'MATCH_BREAKDOWN': {
-          results.push(makeResult_({
-            status: rule.severity || '要確認',
-            category: '概況書',
-            ruleId: rule.rule_id,
-            sheetName: CONFIG.SHEET_KOKYO_FRONT,
-            itemName: rule.item_name,
-            targetCell: '',
-            jumpUrl: '',
-            decisionValue: '',
-            compareValue: '',
-            diff: '',
-            condition: 'MATCH_BREAKDOWN',
-            message: rule.message,
-            detail: rule.source_detail || '',
-          }));
+          const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
+          if (hasLookupConfig) {
+            const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
+            const lookupValue = resolveBreakdownLookupValue_(ss, rule);
+            results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
+          } else {
+            results.push(makeResult_({
+              status: rule.severity || '要確認',
+              category: '概況書',
+              ruleId: rule.rule_id,
+              sheetName: CONFIG.SHEET_KOKYO_FRONT,
+              itemName: rule.item_name,
+              targetCell: '',
+              jumpUrl: '',
+              decisionValue: '',
+              compareValue: '',
+              diff: '',
+              condition: 'MATCH_BREAKDOWN',
+              message: rule.message,
+              detail: rule.source_detail || '',
+            }));
+          }
           break;
         }
 
@@ -1107,7 +1114,23 @@ function runKokyoRules_(ss, ctx) {
           break;
         }
 
+        case 'MATCH_RULE_VALUE': {
+          const actual = String(getFrontMapValue_(frontMap, rule.item_name) || '').trim();
+          const expected = String(rule.source_detail || '').trim();
+          results.push(compareTextsResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, expected, actual, '概況書', '', ''));
+          break;
+        }
+
         case 'CALC_MATCH': {
+          const exprText = normalizeText_(rule.source_detail);
+          const isCellExpr = /[A-Z]+\d+/.test(exprText);
+          if (!isCellExpr) {
+            const actual = String(getFrontMapValue_(frontMap, rule.item_name) || '').trim();
+            const expected = String(rule.source_detail || '').trim();
+            results.push(compareTextsResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, expected, actual, '概況書', '', ''));
+            break;
+          }
+
           if (!backSheet) {
             results.push(makeResult_({
               status: '要確認',
@@ -1187,13 +1210,16 @@ function runKokyoRules_(ss, ctx) {
 }
 
 function resolveBreakdownLookupValue_(ss, rule) {
-  const nameSourceSheet = findTargetSheetByPattern_(ss, rule.lookup_name_source);
-  if (!nameSourceSheet) return null;
-
-  const nameCell = String(rule.lookup_name_cell || '').trim();
   let representativeName = '';
-  if (nameCell) {
-    representativeName = normalizeText_(nameSourceSheet.getRange(nameCell).getDisplayValue());
+  const nameSourcePattern = normalizeText_(rule.lookup_name_source);
+  if (nameSourcePattern) {
+    const nameSourceSheet = findTargetSheetByPattern_(ss, rule.lookup_name_source);
+    if (!nameSourceSheet) return null;
+
+    const nameCell = String(rule.lookup_name_cell || '').trim();
+    if (nameCell) {
+      representativeName = normalizeText_(nameSourceSheet.getRange(nameCell).getDisplayValue());
+    }
   }
 
   const targetSheet = findTargetSheetByPattern_(ss, rule.lookup_sheet_pattern || rule.source_detail);
@@ -2322,6 +2348,46 @@ function compareNumbersResult_(rule, sheetName, itemName, decisionValue, compare
   });
 }
 
+function compareTextsResult_(rule, sheetName, itemName, expectedValue, actualValue, category, targetCell, jumpUrl) {
+  const expected = String(expectedValue || '').trim();
+  const actual = String(actualValue || '').trim();
+
+  if (!expected) {
+    return makeResult_({
+      status: 'SKIP',
+      category: category || '概況書',
+      ruleId: rule.rule_id,
+      sheetName,
+      itemName,
+      targetCell: targetCell || '',
+      jumpUrl: jumpUrl || '',
+      decisionValue: '',
+      compareValue: actual,
+      diff: '',
+      condition: '期待値未設定',
+      message: 'rules_kokyo の source_detail に期待値を設定してください',
+      detail: '',
+    });
+  }
+
+  const ok = normalizeText_(expected) === normalizeText_(actual);
+  return makeResult_({
+    status: ok ? 'OK' : (rule.severity || 'NG'),
+    category: category || '概況書',
+    ruleId: rule.rule_id,
+    sheetName,
+    itemName,
+    targetCell: targetCell || '',
+    jumpUrl: jumpUrl || '',
+    decisionValue: expected,
+    compareValue: actual,
+    diff: '',
+    condition: rule.check_type || '',
+    message: ok ? 'OK' : rule.message,
+    detail: '',
+  });
+}
+
 function ngHeaderNotFound_(rule, sheet) {
   return makeResult_({
     status: rule.severity || 'NG',
@@ -2406,6 +2472,7 @@ function normalizeCheckType_(v) {
     'MATCHDECISIONEXPR': 'MATCH_DECISION_EXPR',
     'MATCHBREAKDOWN': 'MATCH_BREAKDOWN',
     'MATCHBREAKDOWNLOOKUP': 'MATCH_BREAKDOWN_LOOKUP',
+    'MATCHRULEVALUE': 'MATCH_RULE_VALUE',
     'CALCMATCH': 'CALC_MATCH',
     'NOTBLANKWHENROWEXISTS': 'NOT_BLANK_WHEN_ROW_EXISTS',
   };
