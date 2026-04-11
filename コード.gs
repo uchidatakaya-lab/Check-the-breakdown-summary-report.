@@ -1147,7 +1147,7 @@ function runKokyoRules_(ss, ctx) {
         default:
           const debugMsg = checkType
             ? `未対応のcheck_typeです: ${checkType}`
-            : `check_type が空です: row=${rule.__row_index || '?'} rule_id=${rule.rule_id || ''} item=${rule.item_name || ''} raw=${rule.__raw_first || ''}（rules_kokyoの列ずれ・1セルTSV貼付の可能性）`;
+            : `check_type が空です: row=${rule.__row_index || '?'} header_row=${rule.__header_row || '?'} rule_id=${rule.rule_id || ''} item=${rule.item_name || ''} raw=${rule.__raw_first || ''}（rules_kokyoの列ずれ・1セルTSV貼付の可能性）`;
           results.push(makeResult_({
             status: '要確認',
             category: '概況書',
@@ -1533,13 +1533,13 @@ function shouldKeepAiFinding_(text, ai) {
   if (!t) return false;
 
   // 今回は「明らかな誤入力」を中心に拾うため、業務上許容される語は除外
-  if (/^(登録番号|売掛金|買掛金|仮払金|仮受金|本人|該当|該当なし|普通|当座|定期)$/u.test(norm)) return false;
+  if (/^(登録番号|売掛金|買掛金|仮払金|仮受金|本人|該当|該当なし)$/u.test(norm)) return false;
   if (/^T\d{13}$/i.test(norm)) return false; // インボイス登録番号
   if (/^(令和|平成|昭和)\d+年\d+月\d+日$/u.test(norm)) return false;
   if (/^\d+[-‐－~～]\d+月/.test(norm)) return false; // 例: 1-2月利用分
 
   const hasClearTypoSignal =
-    /(誤字|脱字|文字化け|重複|途切れ|存在しません|不自然に連結)/u.test(reason) ||
+    /(誤字|脱字|文字化け|重複|欠落|誤入力|入力ミス|途切れ|存在しません)/u.test(reason) ||
     /(.)\1/u.test(norm); // 例: 北沢沢
 
   // 全角英字だけの一般語（例: Ｌａｂｏｒａｔｏｒｙ）も残す
@@ -1883,7 +1883,9 @@ function loadRulesKokyo_(ss) {
 
   const headerRow = detectHeaderRow_(displayValues);
   const headerKeys = new Set(displayValues[headerRow].map(v => normalizeText_(v).toLowerCase()));
-  const hasHeader = headerKeys.has('rule_id') || headerKeys.has('ruleid');
+  const hasHeader =
+    (headerKeys.has('rule_id') || headerKeys.has('ruleid')) &&
+    (headerKeys.has('check_type') || headerKeys.has('checktype'));
   if (hasHeader) return loadRowsAsObjects_(sheet);
 
   return parseRulesKokyoByPosition_(displayValues);
@@ -2055,6 +2057,9 @@ function loadRowsAsObjects_(sheet) {
 
     const obj = {};
     headers.forEach((h, i) => obj[h] = row[i]);
+    obj.__row_index = r + 1;
+    obj.__header_row = headerRow + 1;
+    obj.__raw_first = String(row[0] || '');
     rows.push(obj);
   }
   return rows;
