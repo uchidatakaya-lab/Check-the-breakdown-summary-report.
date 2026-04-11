@@ -2239,7 +2239,7 @@ function getKokyoSourceType_(rule) {
 function getKokyoSheetNameByRule_(rule, frontSheetName, backFixedSheetName, backMonthlySheetName) {
   if (!getKokyoSourceType_(rule).includes('裏面')) return frontSheetName;
   const cellExpr = normalizeText_(rule.lookup_value_col);
-  if (cellExpr && /[A-Z]+\d+/.test(cellExpr) && backMonthlySheetName) return backMonthlySheetName;
+  if (cellExpr && isKokyoMonthlyExpr_(cellExpr) && backMonthlySheetName) return backMonthlySheetName;
   return backFixedSheetName;
 }
 
@@ -2251,10 +2251,38 @@ function getKokyoValueByRule_(rule, frontMap, backMap) {
 
 function resolveKokyoActualNumber_(rule, frontMap, backMap, backValues) {
   const cellExpr = normalizeText_(rule.lookup_value_col);
-  if (getKokyoSourceType_(rule).includes('裏面') && cellExpr && /[A-Z]+\d+/.test(cellExpr) && Array.isArray(backValues) && backValues.length) {
-    return toNumber_(evaluateCellExpression_(cellExpr, backValues));
+  if (getKokyoSourceType_(rule).includes('裏面') && cellExpr && isKokyoMonthlyExpr_(cellExpr) && Array.isArray(backValues) && backValues.length) {
+    const monthlyExpr = toMonthlyExprWithTotalRow_(cellExpr, backValues);
+    return toNumber_(evaluateCellExpression_(monthlyExpr, backValues));
   }
   return toNumber_(getKokyoValueByRule_(rule, frontMap, backMap));
+}
+
+function isKokyoMonthlyExpr_(text) {
+  const t = normalizeText_(text).replace(/\s+/g, '');
+  if (!t) return false;
+  if (/[A-Z]+\d+/.test(t)) return true;
+  return /^[A-Z]+([+\-*/][A-Z]+)*$/.test(t);
+}
+
+function toMonthlyExprWithTotalRow_(expr, values) {
+  const t = normalizeText_(expr).replace(/\s+/g, '');
+  if (!t) return expr;
+  if (/[A-Z]+\d+/.test(t)) return t;
+  const totalRow = findKokyoTotalRow1Based_(values);
+  if (!totalRow) return t;
+  return t.replace(/([A-Z]+)(?!\d)/g, `$1${totalRow}`);
+}
+
+function findKokyoTotalRow1Based_(values) {
+  for (let r = 0; r < values.length; r++) {
+    for (let c = 0; c < values[r].length; c++) {
+      if (normalizeText_(values[r][c]) === normalizeText_('計')) {
+        return r + 1;
+      }
+    }
+  }
+  return null;
 }
 
 function parseKeyValueSheet_(sheet) {
