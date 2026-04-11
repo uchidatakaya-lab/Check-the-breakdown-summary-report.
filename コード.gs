@@ -21,6 +21,7 @@
  * - Advanced Drive API を ON にしてください
  * - スクリプトプロパティ（任意）:
  *     GEMINI_API_KEY = Gemini API Key
+ *     AI_CHECK_ENABLED = true / false
  *     MOVE_EXCEL_TO_OLD = true / false
  *     MOVE_CONVERTED_TO_OLD = true / false
  *************************************************/
@@ -110,6 +111,10 @@ function getMoveExcelToOldFlag_() {
 
 function getMoveConvertedToOldFlag_() {
   return getFlag_('MOVE_CONVERTED_TO_OLD', true);
+}
+
+function getAiCheckEnabledFlag_() {
+  return getFlag_('AI_CHECK_ENABLED', true);
 }
 
 function getOrCreateOldFolder_(parentFolder) {
@@ -309,7 +314,11 @@ function runChecksCore_(ss) {
 
     const mainResults = runMainRules_(ss, ctx);
     const kokyoResults = runKokyoRules_(ss, ctx);
-    const typoResults = runGlobalInputAnomalyChecks_(ss);
+    const aiCheckEnabled = getAiCheckEnabledFlag_();
+    const typoResults = aiCheckEnabled ? runGlobalInputAnomalyChecks_(ss) : [];
+    if (!aiCheckEnabled) {
+      appendLogRow_(ss, 'AI入力値チェックをスキップしました（AI_CHECK_ENABLED=false）');
+    }
     const bsUnusedResults = buildUnusedBSAccountResults_(ctx);
 
     const allResults = [...mainResults, ...kokyoResults, ...typoResults, ...bsUnusedResults];
@@ -1356,6 +1365,7 @@ function runGlobalInputAnomalyChecks_(ss) {
           }
 
           if (!ai || !ai.is_suspicious) continue;
+          if (!shouldKeepAiFinding_(text, ai)) continue;
 
           const a1 = toA1_(r + 1, c + 1);
           const jumpUrl = buildRangeUrl_(ss, sheetName, a1);
@@ -1441,6 +1451,29 @@ function parseColRefTo1Based_(v) {
   if (/^\d+$/.test(s)) return Number(s);
   const idx = colToIndex_(s);
   return idx >= 0 ? idx + 1 : null;
+}
+
+function shouldKeepAiFinding_(text, ai) {
+  const t = String(text || '').trim();
+  const reason = String((ai && ai.reason) || '');
+  const norm = normalizeText_(t);
+
+  if (!t) return false;
+
+  // 今回は「明らかな誤入力」を中心に拾うため、業務上許容される語は除外
+  if (/^(登録番号|売掛金|買掛金|仮払金|仮受金|本人|該当|該当なし)$/u.test(norm)) return false;
+  if (/^T\d{13}$/i.test(norm)) return false; // インボイス登録番号
+  if (/^(令和|平成|昭和)\d+年\d+月\d+日$/u.test(norm)) return false;
+  if (/^\d+[-‐－~～]\d+月/.test(norm)) return false; // 例: 1-2月利用分
+
+  const hasClearTypoSignal =
+    /(誤字|脱字|文字化け|重複|欠落|誤入力|入力ミス|途切れ|存在しません)/u.test(reason) ||
+    /(.)\1/u.test(norm); // 例: 北沢沢
+
+  // 全角英字だけの一般語（例: Ｌａｂｏｒａｔｏｒｙ）も残す
+  const fullWidthAlphaOnly = /^[Ａ-Ｚａ-ｚ]+$/u.test(norm);
+
+  return hasClearTypoSignal || fullWidthAlphaOnly;
 }
 
 function callGemini_(text) {
@@ -1880,10 +1913,11 @@ function loadRowsAsObjects_(sheet) {
   const { displayValues } = getSheetValues_(sheet);
   if (displayValues.length < 2) return [];
 
-  const headers = displayValues[0].map(h => normalizeText_(h));
+  const headerRow = detectHeaderRow_(displayValues);
+  const headers = displayValues[headerRow].map(h => normalizeText_(h));
   const rows = [];
 
-  for (let r = 1; r < displayValues.length; r++) {
+  for (let r = headerRow + 1; r < displayValues.length; r++) {
     const row = displayValues[r];
     if (row.join('').trim() === '') continue;
 
@@ -1892,6 +1926,23 @@ function loadRowsAsObjects_(sheet) {
     rows.push(obj);
   }
   return rows;
+}
+
+function detectHeaderRow_(displayValues) {
+  const limit = Math.min(displayValues.length, 20);
+  for (let r = 0; r < limit; r++) {
+    const keys = new Set(displayValues[r].map(v => normalizeText_(v).toLowerCase()));
+    const hasRuleId = keys.has('rule_id') || keys.has('ruleid');
+    const hasCheckType =
+      keys.has('check_type') ||
+      keys.has('checktype');
+    const hasItemName = keys.has('item_name') || keys.has('itemname');
+
+    if (hasRuleId && (hasCheckType || hasItemName)) {
+      return r;
+    }
+  }
+  return 0;
 }
 
 function getSheetValues_(sheet) {
