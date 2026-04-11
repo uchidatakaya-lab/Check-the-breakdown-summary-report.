@@ -1141,6 +1141,13 @@ function runKokyoRules_(ss, ctx) {
           break;
         }
 
+        case 'MATCH_RULE_VALUE': {
+          const actual = String(getFrontMapValue_(frontMap, rule.item_name) || '').trim();
+          const expected = String(rule.source_detail || '').trim();
+          results.push(compareTextsResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, expected, actual, '概況書', '', ''));
+          break;
+        }
+
         case 'CALC_MATCH': {
           const exprText = normalizeText_(rule.source_detail);
           const isCellExpr = /[A-Z]+\d+/.test(exprText);
