@@ -1003,7 +1003,7 @@ function runKokyoRules_(ss, ctx) {
     try {
       switch (checkType) {
         case 'NOT_BLANK': {
-          const value = frontMap[rule.item_name];
+          const value = getFrontMapValue_(frontMap, rule.item_name);
           results.push(makeResult_({
             status: isBlank_(value) ? (rule.severity || '要確認') : 'OK',
             category: '概況書',
@@ -1024,7 +1024,7 @@ function runKokyoRules_(ss, ctx) {
 
         case 'CONDITIONAL_NOT_BLANK': {
           const condOk = evaluateConditionAgainstDecision_(rule.condition, ctx);
-          const value = frontMap[rule.item_name];
+          const value = getFrontMapValue_(frontMap, rule.item_name);
           const bad = condOk && isBlank_(value);
 
           results.push(makeResult_({
@@ -1046,7 +1046,7 @@ function runKokyoRules_(ss, ctx) {
         }
 
         case 'MATCH_DECISION': {
-          const frontValue = toNumber_(frontMap[rule.item_name]);
+          const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
           let decisionValue = resolveDecisionExprWithPickRule_(
             rule.source_detail,
             ctx.decisionValues,
@@ -1064,7 +1064,7 @@ function runKokyoRules_(ss, ctx) {
         }
 
         case 'MATCH_DECISION_EXPR': {
-          const frontValue = toNumber_(frontMap[rule.item_name]);
+          const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
           let decisionValue = resolveDecisionExprWithPickRule_(
             rule.source_detail,
             ctx.decisionValues,
@@ -1101,7 +1101,7 @@ function runKokyoRules_(ss, ctx) {
         }
 
         case 'MATCH_BREAKDOWN_LOOKUP': {
-          const frontValue = toNumber_(frontMap[rule.item_name]);
+          const frontValue = toNumber_(getFrontMapValue_(frontMap, rule.item_name));
           const lookupValue = resolveBreakdownLookupValue_(ss, rule);
           results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_FRONT, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
           break;
@@ -1131,13 +1131,13 @@ function runKokyoRules_(ss, ctx) {
           let targetValue = null;
 
           if (rule.rule_id === 'K100') {
-            targetValue = toNumber_(frontMap['売上_収入_高_千円']);
+            targetValue = toNumber_(getFrontMapValue_(frontMap, '売上_収入_高_千円'));
           } else if (rule.rule_id === 'K101') {
-            targetValue = toNumber_(frontMap['売上_収入_原価_千円']);
+            targetValue = toNumber_(getFrontMapValue_(frontMap, '売上_収入_原価_千円'));
           } else if (rule.rule_id === 'K102') {
             targetValue =
-              (toNumber_(frontMap['販管費のうち_役員報酬_千円']) || 0) +
-              (toNumber_(frontMap['販管費のうち_従業員給料_千円']) || 0);
+              (toNumber_(getFrontMapValue_(frontMap, '販管費のうち_役員報酬_千円')) || 0) +
+              (toNumber_(getFrontMapValue_(frontMap, '販管費のうち_従業員給料_千円')) || 0);
           }
 
           results.push(compareNumbersResult_(rule, CONFIG.SHEET_KOKYO_BACK, rule.item_name, targetValue, calcValue, '概況書', '', ''));
@@ -2122,6 +2122,10 @@ function parseKeyValueSheet_(sheet) {
     map[key] = value;
   }
   return map;
+}
+
+function getFrontMapValue_(frontMap, key) {
+  return frontMap[normalizeText_(key)] || '';
 }
 
 function evaluateConditionAgainstDecision_(condition, ctx) {
