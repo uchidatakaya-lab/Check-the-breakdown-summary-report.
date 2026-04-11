@@ -504,6 +504,9 @@ function runMainRules_(ss, ctx) {
         case 'NOT_BLANK_WHEN_PRESENT':
           results.push(...checkNotBlankWhenPresent_(rule, targetSheet, display, ctx));
           break;
+        case 'NOT_BLANK_WHEN_ROW_EXISTS':
+          results.push(...checkNotBlankWhenRowExists_(rule, targetSheet, display, ctx));
+          break;
         case 'NOT_BLANK_WHEN_AMOUNT_EXISTS':
           results.push(...checkNotBlankWhenAmountExists_(rule, targetSheet, rows, ctx));
           break;
@@ -790,6 +793,72 @@ function checkNotBlankWhenAmountExists_(rule, sheet, rows, ctx) {
     message: foundBlank ? rule.message : 'OK',
     detail: '',
   })];
+}
+
+function checkNotBlankWhenRowExists_(rule, sheet, displayValues, ctx) {
+  const found = findCellByText_(displayValues, rule.header_name);
+  if (!found) {
+    return [makeResult_({
+      status: '要確認',
+      category: '内訳書',
+      ruleId: rule.rule_id,
+      sheetName: sheet.getName(),
+      itemName: rule.header_name,
+      targetCell: '',
+      jumpUrl: '',
+      decisionValue: '',
+      compareValue: '',
+      diff: '',
+      condition: '固定項目未検出',
+      message: `${rule.header_name} が見つかりません`,
+      detail: '',
+    })];
+  }
+
+  const targetCol = found.col;
+  const startRow = found.row + 1;
+  const triggerCols = parseColumnList_(rule.account_col || 'B');
+
+  let foundBlank = false;
+  let foundRow = -1;
+  for (let r = startRow; r < displayValues.length; r++) {
+    const hasTrigger = triggerCols.some(col => normalizeText_(displayValues[r][col]) !== '');
+    if (!hasTrigger) continue;
+
+    const targetText = normalizeText_(displayValues[r][targetCol]);
+    if (!targetText) {
+      foundBlank = true;
+      foundRow = r;
+      break;
+    }
+  }
+
+  const a1 = foundBlank ? toA1_(foundRow + 1, targetCol + 1) : '';
+  return [makeResult_({
+    status: foundBlank ? (rule.severity || '要確認') : 'OK',
+    category: '内訳書',
+    ruleId: rule.rule_id,
+    sheetName: sheet.getName(),
+    itemName: rule.header_name,
+    targetCell: a1,
+    jumpUrl: a1 ? buildRangeUrl_(ctx.ss, sheet.getName(), a1) : '',
+    decisionValue: '',
+    compareValue: '',
+    diff: '',
+    condition: 'NOT_BLANK_WHEN_ROW_EXISTS',
+    message: foundBlank ? rule.message : 'OK',
+    detail: '',
+  })];
+}
+
+function parseColumnList_(expr) {
+  const raw = String(expr || '').trim();
+  if (!raw) return [1]; // B
+  const parts = raw.split(/[+,]/).map(s => s.trim()).filter(Boolean);
+  const cols = parts
+    .map(p => colToIndex_(p))
+    .filter(i => i >= 0);
+  return cols.length ? cols : [1];
 }
 
 function checkHeader_(rule, sheet, displayValues, ctx) {
@@ -1805,7 +1874,47 @@ function loadRulesMain_(ss) {
 }
 
 function loadRulesKokyo_(ss) {
-  return loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_RULES_KOKYO));
+  const sheet = getRequiredSheet_(ss, CONFIG.SHEET_RULES_KOKYO);
+  const { displayValues } = getSheetValues_(sheet);
+  if (displayValues.length < 2) return [];
+
+  const headerRow = detectHeaderRow_(displayValues);
+  const headerKeys = new Set(displayValues[headerRow].map(v => normalizeText_(v).toLowerCase()));
+  const hasHeader = headerKeys.has('rule_id') || headerKeys.has('ruleid');
+  if (hasHeader) return loadRowsAsObjects_(sheet);
+
+  return parseRulesKokyoByPosition_(displayValues);
+}
+
+function parseRulesKokyoByPosition_(displayValues) {
+  const out = [];
+  for (let r = 0; r < displayValues.length; r++) {
+    const row = displayValues[r];
+    if (!row || row.join('').trim() === '') continue;
+
+    const idMatch = String(row[0] || '').match(/K\d{3}/);
+    if (!idMatch) continue;
+
+    out.push({
+      rule_id: idMatch[0],
+      enabled: row[1],
+      item_name: row[2],
+      check_type: row[3],
+      document_type: row[4],
+      source_detail: row[5],
+      value_pick_rule: row[6],
+      account_match_mode: row[7],
+      lookup_sheet_pattern: row[8],
+      lookup_name_source: row[9],
+      lookup_name_cell: row[10],
+      lookup_match_col: row[11],
+      lookup_value_col: row[12],
+      condition: row[13],
+      severity: row[14],
+      message: row[15]
+    });
+  }
+  return out;
 }
 
 function loadGroupMaster_(ss) {
@@ -2256,6 +2365,7 @@ function normalizeCheckType_(v) {
     'MATCHBREAKDOWN': 'MATCH_BREAKDOWN',
     'MATCHBREAKDOWNLOOKUP': 'MATCH_BREAKDOWN_LOOKUP',
     'CALCMATCH': 'CALC_MATCH',
+    'NOTBLANKWHENROWEXISTS': 'NOT_BLANK_WHEN_ROW_EXISTS',
   };
   return aliasMap[t.replace(/[_\-\s]/g, '')] || t;
 }
