@@ -43,6 +43,7 @@ const CONFIG = {
 
   SHEET_RESULT: 'check_result',
   SHEET_LOG: 'check_log',
+  SHEET_ACCOUNT_MATCH_LOG: 'account_match_log',
   SHEET_REPORT: 'report_A4',
   AI_CHECK_START_ROW: 5,
 };
@@ -313,6 +314,7 @@ function runChecksCore_(ss) {
     if (!aiCheckEnabled) {
       appendLogRow_(ss, 'AI入力値チェックをスキップしました（AI_CHECK_ENABLED=false）');
     }
+    writeAccountMatchLog_(ss, ctx);
     const bsUnusedResults = buildUnusedBSAccountResults_(ctx);
 
     const allResults = [...mainResults, ...kokyoResults, ...typoResults, ...bsUnusedResults];
@@ -361,6 +363,17 @@ function resetResultSheetsInSpreadsheet_(ss) {
   log.clearContents().clearFormats();
   log.getRange(1, 1, 1, 2).setValues([['日時', 'ログ']]);
 
+  const accountLog = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_ACCOUNT_MATCH_LOG);
+  accountLog.clearContents().clearFormats();
+  accountLog.getRange(1, 1, 1, 6).setValues([[
+    'No',
+    '勘定科目',
+    '決算書値',
+    '照合利用有無',
+    '対象レンジ内',
+    '備考'
+  ]]);
+
   const report = ss.getSheetByName(CONFIG.SHEET_REPORT);
   if (report) ss.deleteSheet(report);
 }
@@ -388,42 +401,9 @@ function buildContext_(ss) {
 function buildUnusedBSAccountResults_(ctx) {
   const results = [];
 
-  const targetSet = new Set([
-    '現金及び預金',
-    '売掛金',
-    '買掛金',
-    '未払金',
-    '未払費用',
-    '長期借入金',
-    '短期借入金',
-    '役員借入金',
-    '貸付金',
-    '短期貸付金',
-    '長期貸付金',
-    '土地',
-    '建物',
-    '機械装置',
-    '車両',
-    '車両運搬具',
-    '商品',
-    '製品',
-    '半製品',
-    '仕掛品',
-    '原材料',
-    '貯蔵品',
-    '有価証券',
-    '出資金',
-    '預託金',
-    '仮払金',
-    '仮受金',
-    '受取手形',
-    '支払手形'
-  ]);
-
   ctx.bsAccounts.forEach(account => {
     const a = normalizeText_(account);
     if (!a) return;
-    if (!targetSet.has(a)) return;
 
     if (!ctx.usedDecisionAccounts.has(a)) {
       results.push(makeResult_({
@@ -445,6 +425,36 @@ function buildUnusedBSAccountResults_(ctx) {
   });
 
   return results;
+}
+
+function writeAccountMatchLog_(ss, ctx) {
+  const sheet = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_ACCOUNT_MATCH_LOG);
+  sheet.clearContents().clearFormats();
+  sheet.getRange(1, 1, 1, 6).setValues([[
+    'No',
+    '勘定科目',
+    '決算書値',
+    '照合利用有無',
+    '対象レンジ内',
+    '備考'
+  ]]);
+
+  const rows = (ctx.bsAccounts || []).map((account, idx) => {
+    const key = normalizeText_(account);
+    const used = key ? ctx.usedDecisionAccounts.has(key) : false;
+    return [
+      idx + 1,
+      key || '',
+      key ? (ctx.decisionMap[key] != null ? ctx.decisionMap[key] : '') : '',
+      used ? '照合済み' : '未照合',
+      '対象',
+      used ? '' : '内訳書照合で未使用'
+    ];
+  });
+
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, 6).setValues(rows);
+  }
 }
 
 /* =========================
