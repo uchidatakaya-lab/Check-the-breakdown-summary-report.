@@ -400,12 +400,24 @@ function buildContext_(ss) {
 
 function buildUnusedBSAccountResults_(ctx) {
   const results = [];
+  const excludedAccounts = new Set([
+    normalizeText_('普通預金'),
+    normalizeText_('未払消費税等'),
+    normalizeText_('未払法人税等')
+  ]);
 
   ctx.bsAccounts.forEach(account => {
     const a = normalizeText_(account);
     if (!a) return;
+    if (excludedAccounts.has(a)) return;
 
-    if (!ctx.usedDecisionAccounts.has(a)) {
+    const isUnused = !ctx.usedDecisionAccounts.has(a);
+    const note = isUnused ? '内訳書照合で未使用' : '';
+    const decisionValue = toNumber_(ctx.decisionMap[a]);
+    const hasAmount = decisionValue != null && decisionValue >= 1;
+    const hasUnusedNote = note.includes('内訳書照合で未使用');
+
+    if (isUnused && hasAmount && hasUnusedNote) {
       results.push(makeResult_({
         status: '要確認',
         category: '未照合BS科目',
@@ -414,7 +426,7 @@ function buildUnusedBSAccountResults_(ctx) {
         itemName: a,
         targetCell: '',
         jumpUrl: '',
-        decisionValue: ctx.decisionMap[a] || '',
+        decisionValue: decisionValue,
         compareValue: '',
         diff: '',
         condition: 'UNUSED_BS_ACCOUNT',
@@ -1813,7 +1825,11 @@ function buildA4Report_(ss) {
 
   const picked = rows.filter(r => {
     const status = String(r[colIndex['判定']] || '');
-    return status !== 'OK';
+    if (status === 'OK') return false;
+    const decisionValue = toNumber_(r[colIndex['決算書値']]);
+    const compareValue = toNumber_(r[colIndex['比較値']]);
+    const bothZero = decisionValue === 0 && compareValue === 0;
+    return !bothZero;
   });
 
   const out = [[
