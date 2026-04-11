@@ -1881,6 +1881,7 @@ function parseDecisionSheet_(sheet) {
   const { values } = getSheetValues_(sheet);
   const map = {};
   const bsAccounts = [];
+  const bsTargetRanges = findBsAccountTargetRanges_(values);
 
   let section = '';
   let inBS = false;
@@ -1915,7 +1916,7 @@ function parseDecisionSheet_(sheet) {
       map[`${section}:${key}`] = amount;
     }
 
-    if (inBS && amount != null && isRealBSAccount_(key)) {
+    if (isInBsAccountTargetRanges_(r, bsTargetRanges) && amount != null && isRealBSAccount_(key)) {
       bsAccounts.push(key);
     }
   }
@@ -1924,6 +1925,43 @@ function parseDecisionSheet_(sheet) {
     map,
     bsAccounts: [...new Set(bsAccounts)],
   };
+}
+
+function findBsAccountTargetRanges_(values) {
+  const indexOfContains = (text) => {
+    const needle = normalizeText_(text);
+    for (let r = 0; r < values.length; r++) {
+      const a = normalizeText_(values[r][0]);
+      if (!a) continue;
+      if (a.includes(needle)) return r;
+    }
+    return -1;
+  };
+
+  const otherCurrentAssetsTotal = indexOfContains('その他流動資産合計');
+  const tangibleFixedAssetsTotal = indexOfContains('有形固定資産合計');
+  const investmentAndOtherAssetsTotal = indexOfContains('投資その他の資産合計');
+  const assetsTotal = indexOfContains('資産の部合計');
+  const fixedLiabilitiesTotal = indexOfContains('固定負債合計');
+
+  return {
+    topStart: 0,
+    topEnd: otherCurrentAssetsTotal >= 0 ? otherCurrentAssetsTotal : -1, // end-exclusive
+    middleAssetsStart: tangibleFixedAssetsTotal >= 0 ? tangibleFixedAssetsTotal + 1 : -1,
+    middleAssetsEnd: investmentAndOtherAssetsTotal >= 0 ? investmentAndOtherAssetsTotal : -1, // end-exclusive
+    liabilitiesStart: assetsTotal >= 0 ? assetsTotal + 1 : -1,
+    liabilitiesEnd: fixedLiabilitiesTotal >= 0 ? fixedLiabilitiesTotal : -1, // end-exclusive
+  };
+}
+
+function isInBsAccountTargetRanges_(rowIndex0, ranges) {
+  if (!ranges) return false;
+  const inTop = ranges.topEnd > ranges.topStart && rowIndex0 >= ranges.topStart && rowIndex0 < ranges.topEnd;
+  const inMiddleAssets = ranges.middleAssetsStart >= 0 && ranges.middleAssetsEnd > ranges.middleAssetsStart &&
+    rowIndex0 >= ranges.middleAssetsStart && rowIndex0 < ranges.middleAssetsEnd;
+  const inLiabilities = ranges.liabilitiesStart >= 0 && ranges.liabilitiesEnd > ranges.liabilitiesStart &&
+    rowIndex0 >= ranges.liabilitiesStart && rowIndex0 < ranges.liabilitiesEnd;
+  return inTop || inMiddleAssets || inLiabilities;
 }
 
 function pickDecisionAmount_(colB, colC, colD) {
