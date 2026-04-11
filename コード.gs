@@ -35,6 +35,7 @@ const CONFIG = {
   SHEET_GROUP_MASTER: 'account_group_master',
   SHEET_NORMALIZE_MASTER: 'account_normalize_master',
   SHEET_EXCLUDE_MASTER: 'account_exclude_master',
+  SHEET_AI_TARGETS: 'ai_check_targets',
 
   SHEET_KOKYO_FRONT: '概況書表面',
   SHEET_KOKYO_BACK: '概況書裏面',
@@ -42,6 +43,7 @@ const CONFIG = {
   SHEET_RESULT: 'check_result',
   SHEET_LOG: 'check_log',
   SHEET_REPORT: 'report_A4',
+  AI_CHECK_START_ROW: 5,
 };
 
 function onOpen() {
@@ -1305,66 +1307,140 @@ function runGlobalInputAnomalyChecks_(ss) {
     CONFIG.SHEET_GROUP_MASTER,
     CONFIG.SHEET_NORMALIZE_MASTER,
     CONFIG.SHEET_EXCLUDE_MASTER,
+    CONFIG.SHEET_AI_TARGETS,
     CONFIG.SHEET_RESULT,
     CONFIG.SHEET_LOG,
     CONFIG.SHEET_REPORT
   ]);
 
   const aiCache = {};
+  const aiTargets = loadAiCheckTargets_(ss);
+  const hasTargetConfig = Object.keys(aiTargets).length > 0;
 
   ss.getSheets().forEach(sheet => {
     const sheetName = sheet.getName();
     if (ignoreSheets.has(sheetName)) return;
-    if (!normalizeText_(sheetName).includes('の内訳')) return;
+
+    const targets = resolveAiTargetsForSheet_(aiTargets, sheetName);
+    if (hasTargetConfig) {
+      if (!targets.length) return;
+    } else {
+      if (!normalizeText_(sheetName).includes('の内訳')) return;
+    }
 
     const values = sheet.getDataRange().getDisplayValues();
-    const startCol = 2;
-    const endCol = 21;
+    const ranges = hasTargetConfig
+      ? targets.filter(t => t.enabled)
+      : [{ startCol: 2, endCol: 21 }];
+    if (hasTargetConfig && ranges.length === 0) return;
+    const visited = new Set();
 
-    for (let r = 0; r < values.length; r++) {
-      for (let c = startCol - 1; c <= endCol - 1; c++) {
-        const raw = values[r][c];
-        const text = String(raw || '').trim();
-        if (!text) continue;
-        if (/^[0-9,\.\-△()\/年月日円千百]+$/.test(text)) continue;
-        if (text.length <= 1) continue;
+    for (const range of ranges) {
+      for (let r = CONFIG.AI_CHECK_START_ROW - 1; r < values.length; r++) {
+        for (let c = range.startCol - 1; c <= range.endCol - 1; c++) {
+          const cellKey = `${r}:${c}`;
+          if (visited.has(cellKey)) continue;
+          visited.add(cellKey);
 
-        let ai = aiCache[text];
-        if (!ai) {
-          ai = callGeminiBreakdownCheckSafe_(text, sheetName);
-          aiCache[text] = ai;
-          Utilities.sleep(120);
+          const raw = values[r][c];
+          const text = String(raw || '').trim();
+          if (!text) continue;
+          if (/^[0-9,\.\-△()\/年月日円千百]+$/.test(text)) continue;
+          if (text.length <= 1) continue;
+
+          let ai = aiCache[text];
+          if (!ai) {
+            ai = callGeminiBreakdownCheckSafe_(text, sheetName);
+            aiCache[text] = ai;
+            Utilities.sleep(120);
+          }
+
+          if (!ai || !ai.is_suspicious) continue;
+
+          const a1 = toA1_(r + 1, c + 1);
+          const jumpUrl = buildRangeUrl_(ss, sheetName, a1);
+
+          results.push(makeResult_({
+            status: '要確認',
+            category: '入力値チェック',
+            ruleId: 'AI001',
+            sheetName: sheetName,
+            itemName: `${a1}: ${text}`,
+            targetCell: a1,
+            jumpUrl: jumpUrl,
+            decisionValue: '',
+            compareValue: text,
+            diff: '',
+            condition: 'BREAKDOWN_TEXT_GEMINI_CHECK',
+            message: ai.reason || '不自然な入力の可能性があります',
+            detail: '',
+            aiJudge: ai.is_suspicious ? '不自然' : '問題なし',
+            aiReason: ai.reason || '',
+            aiSuggestion1: ai.suggestions && ai.suggestions[0] ? ai.suggestions[0] : '',
+            aiSuggestion2: ai.suggestions && ai.suggestions[1] ? ai.suggestions[1] : '',
+          }));
         }
-
-        if (!ai || !ai.is_suspicious) continue;
-
-        const a1 = toA1_(r + 1, c + 1);
-        const jumpUrl = buildRangeUrl_(ss, sheetName, a1);
-
-        results.push(makeResult_({
-          status: '要確認',
-          category: '入力値チェック',
-          ruleId: 'AI001',
-          sheetName: sheetName,
-          itemName: `${a1}: ${text}`,
-          targetCell: a1,
-          jumpUrl: jumpUrl,
-          decisionValue: '',
-          compareValue: text,
-          diff: '',
-          condition: 'BREAKDOWN_TEXT_GEMINI_CHECK',
-          message: ai.reason || '不自然な入力の可能性があります',
-          detail: '',
-          aiJudge: ai.is_suspicious ? '不自然' : '問題なし',
-          aiReason: ai.reason || '',
-          aiSuggestion1: ai.suggestions && ai.suggestions[0] ? ai.suggestions[0] : '',
-          aiSuggestion2: ai.suggestions && ai.suggestions[1] ? ai.suggestions[1] : '',
-        }));
       }
     }
   });
 
   return results;
+}
+
+function resolveAiTargetsForSheet_(aiTargets, sheetName) {
+  const out = [];
+  const seenKeys = new Set();
+  const normSheet = normalizeText_(sheetName);
+
+  if (aiTargets[sheetName]) {
+    out.push(...aiTargets[sheetName]);
+    seenKeys.add(sheetName);
+  }
+
+  Object.keys(aiTargets).forEach(k => {
+    if (seenKeys.has(k)) return;
+    const normKey = normalizeText_(k);
+    if (!normKey) return;
+    if (normSheet.includes(normKey)) {
+      out.push(...aiTargets[k]);
+    }
+  });
+
+  return out;
+}
+
+function loadAiCheckTargets_(ss) {
+  const sheet = ss.getSheetByName(CONFIG.SHEET_AI_TARGETS);
+  if (!sheet) return {};
+
+  const rows = loadRowsAsObjects_(sheet);
+  const map = {};
+
+  rows.forEach(r => {
+    const sheetName = String(r.sheet_name || r.sheetname || r['sheet name'] || '').trim();
+    if (!sheetName) return;
+
+    const enabled = String(r.enabled == null ? 'TRUE' : r.enabled).trim().toUpperCase();
+    const startCol = parseColRefTo1Based_(r.start_col || r.startcol || r['start col']) || 2;
+    const endCol = parseColRefTo1Based_(r.end_col || r.endcol || r['end col']) || 21;
+
+    if (!map[sheetName]) map[sheetName] = [];
+    map[sheetName].push({
+      enabled: enabled !== 'FALSE' && enabled !== '0' && enabled !== 'NO',
+      startCol: Math.max(1, Math.min(startCol, endCol)),
+      endCol: Math.max(startCol, endCol)
+    });
+  });
+
+  return map;
+}
+
+function parseColRefTo1Based_(v) {
+  const s = String(v || '').trim().toUpperCase();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return Number(s);
+  const idx = colToIndex_(s);
+  return idx >= 0 ? idx + 1 : null;
 }
 
 function callGemini_(text) {
