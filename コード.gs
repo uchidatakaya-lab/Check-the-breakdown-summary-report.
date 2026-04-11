@@ -1366,12 +1366,8 @@ function runGlobalInputAnomalyChecks_(ss) {
 }
 
 function callGemini_(text) {
-  const props = PropertiesService.getScriptProperties();
-
-  const apiKey = props.getProperty("GEMINI_API_KEY");
-  const model =
-    props.getProperty("GEMINI_MODEL") ||
-    "gemini-3.1-pro-preview";
+  const apiKey = getGeminiApiKey_();
+  const model = getGeminiModel_();
 
   if (!apiKey) {
     return "Geminiキー未設定";
@@ -1416,6 +1412,15 @@ function callGemini_(text) {
   return json.candidates?.[0]?.content?.parts?.[0]?.text || "応答なし";
 }
 
+function getGeminiApiKey_() {
+  return PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY') || '';
+}
+
+function getGeminiModel_() {
+  const raw = PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || 'gemini-2.5-flash';
+  return String(raw).replace(/^models\//, '');
+}
+
 function callGeminiBreakdownCheck_(text, sheetName) {
   const apiKey = getGeminiApiKey_();
   if (!apiKey) {
@@ -1426,7 +1431,8 @@ function callGeminiBreakdownCheck_(text, sheetName) {
     };
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  const model = getGeminiModel_();
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const prompt = `
 あなたは税務申告書の内訳書チェック支援AIです。
