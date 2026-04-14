@@ -1282,11 +1282,15 @@ function resolveBreakdownLookupValue_(ss, rule) {
   }
 
   const values = targetSheet.getDataRange().getDisplayValues();
-  let matchCol = colToIndex_(rule.lookup_match_col);
+  const rawMatchCol = String(rule.lookup_match_col || '').trim();
+  let matchCol = colToIndex_(rawMatchCol);
   if (matchCol < 0) {
     matchCol = a1ColToIndex_(rule.lookup_name_cell);
     if (matchCol >= 0) {
-      appendLogRow_(ss, `[LOOKUP][${ruleId}] lookup_match_col が不正のため lookup_name_cell の列を代用: ${rule.lookup_name_cell}`);
+      const reason = rawMatchCol
+        ? `lookup_match_col が不正`
+        : 'lookup_match_col 未設定';
+      appendLogRow_(ss, `[LOOKUP][${ruleId}] ${reason}のため lookup_name_cell の列を代用: ${rule.lookup_name_cell}`);
     }
   }
   const matchMode = rule.account_match_mode || 'contains';
@@ -2478,6 +2482,19 @@ function colToIndex_(col) {
     n = n * 26 + (s.charCodeAt(i) - 64);
   }
   return n - 1;
+}
+
+function indexToCol_(index) {
+  let n = Number(index);
+  if (!Number.isFinite(n) || n < 0) return '';
+  n = Math.floor(n);
+
+  let s = '';
+  while (n >= 0) {
+    s = String.fromCharCode((n % 26) + 65) + s;
+    n = Math.floor(n / 26) - 1;
+  }
+  return s;
 }
 
 function findHeaderRowByText_(rows, text, colIndex) {
