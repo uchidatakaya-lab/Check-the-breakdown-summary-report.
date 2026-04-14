@@ -1303,6 +1303,8 @@ function resolveBreakdownLookupValue_(ss, rule) {
   appendLogRow_(ss, `[LOOKUP][${ruleId}] 照合開始: targetSheet=${targetSheet.getName()} matchCol=${indexToCol_(matchCol)} valueCol=${rule.lookup_value_col || '(blank)'} mode=${matchMode} representative=${representativeName || '(blank)'}`);
 
   for (let r = 0; r < values.length; r++) {
+    if (!representativeName && !isLikelyBreakdownDataRow_(values[r], r)) continue;
+
     const cellText = values[r][matchCol];
     if (!cellText) continue;
 
@@ -1315,6 +1317,14 @@ function resolveBreakdownLookupValue_(ss, rule) {
 
   appendLogRow_(ss, `[LOOKUP][${ruleId}] 一致行なし: representative=${representativeName || '(blank)'} matchCol=${indexToCol_(matchCol)}`);
   return null;
+}
+
+function isLikelyBreakdownDataRow_(row, rowIndex) {
+  if (!row) return false;
+  const firstCol = normalizeText_(row[0]);
+  if (firstCol.includes('通常明細行') || firstCol.includes('明細行')) return true;
+  if (firstCol.includes('明細区分')) return false;
+  return rowIndex >= 4;
 }
 
 function a1ColToIndex_(a1) {
