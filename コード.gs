@@ -1256,39 +1256,64 @@ function runKokyoRules_(ss, ctx) {
 }
 
 function resolveBreakdownLookupValue_(ss, rule) {
+  const ruleId = rule.rule_id || '';
   let representativeName = '';
   const nameSourcePattern = normalizeText_(rule.lookup_name_source);
   if (nameSourcePattern) {
     const nameSourceSheet = findTargetSheetByPattern_(ss, rule.lookup_name_source);
-    if (!nameSourceSheet) return null;
+    if (!nameSourceSheet) {
+      appendLogRow_(ss, `[LOOKUP][${ruleId}] lookup_name_source の対象シートが見つかりません: ${rule.lookup_name_source}`);
+      return null;
+    }
 
     const nameCell = String(rule.lookup_name_cell || '').trim();
     if (nameCell) {
       representativeName = normalizeText_(nameSourceSheet.getRange(nameCell).getDisplayValue());
+      appendLogRow_(ss, `[LOOKUP][${ruleId}] 代表者名取得: sheet=${nameSourceSheet.getName()} cell=${nameCell} value=${representativeName || '(blank)'}`);
+    } else {
+      appendLogRow_(ss, `[LOOKUP][${ruleId}] lookup_name_cell が未設定のため代表者名を取得できません`);
     }
   }
 
   const targetSheet = findTargetSheetByPattern_(ss, rule.lookup_sheet_pattern || rule.source_detail);
-  if (!targetSheet) return null;
+  if (!targetSheet) {
+    appendLogRow_(ss, `[LOOKUP][${ruleId}] lookup_sheet_pattern の対象シートが見つかりません: ${rule.lookup_sheet_pattern || rule.source_detail}`);
+    return null;
+  }
 
   const values = targetSheet.getDataRange().getDisplayValues();
-  let matchCol = colToIndex_(rule.lookup_match_col);
+  const rawMatchCol = String(rule.lookup_match_col || '').trim();
+  let matchCol = colToIndex_(rawMatchCol);
   if (matchCol < 0) {
     matchCol = a1ColToIndex_(rule.lookup_name_cell);
+    if (matchCol >= 0) {
+      const reason = rawMatchCol
+        ? `lookup_match_col が不正`
+        : 'lookup_match_col 未設定';
+      appendLogRow_(ss, `[LOOKUP][${ruleId}] ${reason}のため lookup_name_cell の列を代用: ${rule.lookup_name_cell}`);
+    }
   }
   const matchMode = rule.account_match_mode || 'contains';
 
-  if (matchCol < 0) return null;
+  if (matchCol < 0) {
+    appendLogRow_(ss, `[LOOKUP][${ruleId}] lookup_match_col が不正です: ${rule.lookup_match_col || '(blank)'}`);
+    return null;
+  }
+
+  appendLogRow_(ss, `[LOOKUP][${ruleId}] 照合開始: targetSheet=${targetSheet.getName()} matchCol=${indexToCol_(matchCol)} valueCol=${rule.lookup_value_col || '(blank)'} mode=${matchMode} representative=${representativeName || '(blank)'}`);
 
   for (let r = 0; r < values.length; r++) {
     const cellText = values[r][matchCol];
     if (!cellText) continue;
 
     if (!representativeName || isMatchByMode_(cellText, representativeName, matchMode)) {
-      return getMultiColValue_(values[r], rule.lookup_value_col);
+      const value = getMultiColValue_(values[r], rule.lookup_value_col);
+      appendLogRow_(ss, `[LOOKUP][${ruleId}] 一致行: row=${r + 1} matchValue=${normalizeText_(cellText)} lookupValue=${value}`);
+      return value;
     }
   }
 
+  appendLogRow_(ss, `[LOOKUP][${ruleId}] 一致行なし: representative=${representativeName || '(blank)'} matchCol=${indexToCol_(matchCol)}`);
   return null;
 }
 
@@ -2457,6 +2482,19 @@ function colToIndex_(col) {
     n = n * 26 + (s.charCodeAt(i) - 64);
   }
   return n - 1;
+}
+
+function indexToCol_(index) {
+  let n = Number(index);
+  if (!Number.isFinite(n) || n < 0) return '';
+  n = Math.floor(n);
+
+  let s = '';
+  while (n >= 0) {
+    s = String.fromCharCode((n % 26) + 65) + s;
+    n = Math.floor(n / 26) - 1;
+  }
+  return s;
 }
 
 function findHeaderRowByText_(rows, text, colIndex) {
