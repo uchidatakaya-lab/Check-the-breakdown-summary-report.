@@ -1,0 +1,284 @@
+/*************************************************
+ * 新_統合ルール
+ * U列（重要度）・V列（メッセージ）自動補完
+ *
+ * 仕様
+ * - A:T列は変更しない
+ * - U列・V列が空欄のときだけ生成
+ * - 既に値が入っているU/Vは上書きしない
+ * - 担当者は実際の申告書で確認する前提のため、
+ *   列名・セル番地・Excel列記号はメッセージに含めない
+ *************************************************/
+
+ 
+
+function fillRuleSeverityAndMessage() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('新_統合ルール');
+  if (!sheet) throw new Error('新_統合ルール シートが見つかりません。');
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2) return;
+
+  const values = sheet.getRange(1, 1, lastRow, lastCol).getDisplayValues();
+  const header = values[0];
+
+  const colMap = buildHeaderMap_(header);
+
+  const requiredHeaders = [
+    'ルールID',
+    'チェック種別',
+    '照合元シート名（部分一致）',
+    '照合元項目・見出し',
+    '照合先シート名（部分一致）',
+    '照合先項目・見出し',
+    '照合先値指定',
+    '条件式',
+    '重要度',
+    'メッセージ'
+  ];
+
+  const missing = requiredHeaders.filter(h => !(h in colMap));
+  if (missing.length) {
+    throw new Error('必要な見出しが不足しています: ' + missing.join(', '));
+  }
+
+  const severityCol = colMap['重要度'] + 1; // U
+  const messageCol = colMap['メッセージ'] + 1; // V
+
+  const severityValues = [];
+  const messageValues = [];
+
+  let updateCount = 0;
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+
+    const rule = {
+      ruleId: getCell_(row, colMap, 'ルールID'),
+      checkType: normalizeCheckTypeLabel_(getCell_(row, colMap, 'チェック種別')),
+      srcSheet: getCell_(row, colMap, '照合元シート名（部分一致）'),
+      srcItem: getCell_(row, colMap, '照合元項目・見出し'),
+      dstSheet: getCell_(row, colMap, '照合先シート名（部分一致）'),
+      dstItem: getCell_(row, colMap, '照合先項目・見出し'),
+      dstExpr: getCell_(row, colMap, '照合先値指定'),
+      conditionExpr: getCell_(row, colMap, '条件式'),
+      severity: getCell_(row, colMap, '重要度'),
+      message: getCell_(row, colMap, 'メッセージ')
+    };
+
+    let newSeverity = rule.severity;
+    let newMessage = rule.message;
+
+    if (!rule.severity) {
+      newSeverity = buildDefaultSeverity_(rule);
+    }
+    if (!rule.message) {
+      newMessage = buildDefaultMessage_(rule);
+    }
+
+    if (newSeverity !== rule.severity || newMessage !== rule.message) {
+      updateCount++;
+    }
+
+    severityValues.push([newSeverity]);
+    messageValues.push([newMessage]);
+  }
+
+  // U列・V列をまとめて書込（2行目以降）
+  sheet.getRange(2, severityCol, severityValues.length, 1).setValues(severityValues);
+  sheet.getRange(2, messageCol, messageValues.length, 1).setValues(messageValues);
+
+  SpreadsheetApp.getUi().alert(
+    '完了しました。' + updateCount + '件の重要度／メッセージを補完しました。'
+  );
+}
+
+/**
+ * メニュー追加
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('照合ツール')
+    .addItem('照合実行（このブック）', 'runChecks')
+    .addItem('結果シート初期化', 'resetResultSheets')
+    .addItem('テスト実行（folderId手入力）', 'testRunFromPrompt')
+    .addSeparator()
+    .addItem('空欄の重要度・メッセージを補完', 'fillRuleSeverityAndMessage_')
+    .addToUi();
+}
+/**
+ * 見出し -> 列index
+ */
+function buildHeaderMap_(headerRow) {
+  const map = {};
+  headerRow.forEach((name, i) => {
+    const key = String(name || '').trim();
+    if (key) map[key] = i;
+  });
+  return map;
+}
+
+function getCell_(row, colMap, key) {
+  const idx = colMap[key];
+  if (idx == null) return '';
+  return String(row[idx] || '').trim();
+}
+
+/**
+ * チェック種別の表記ゆれ吸収
+ */
+function normalizeCheckTypeLabel_(s) {
+  const v = String(s || '').trim();
+
+  if (!v) return '';
+
+  if (v === '数値照合') return '数値照合';
+  if (v === '文字列照合') return '文字列照合';
+  if (v === '空欄チェック') return '空欄チェック';
+  if (v === '条件付空欄チェック') return '条件付空欄チェック';
+  if (v === '見出し存在チェック') return '見出し存在チェック';
+  if (v === '存在チェック') return '存在チェック';
+  if (v === '固定値照合') return '固定値照合';
+
+  // 英語系が紛れても吸収
+  const upper = v.toUpperCase();
+  if (upper === 'VALUE_MATCH') return '数値照合';
+  if (upper === 'TEXT_MATCH') return '文字列照合';
+  if (upper === 'NOT_BLANK') return '空欄チェック';
+  if (upper === 'CONDITIONAL_NOT_BLANK') return '条件付空欄チェック';
+  if (upper === 'HEADER_EXISTS') return '見出し存在チェック';
+  if (upper === 'EXISTS') return '存在チェック';
+  if (upper === 'FIXED_MATCH') return '固定値照合';
+
+  return v;
+}
+
+/**
+ * 空欄時の重要度自動決定
+ */
+function buildDefaultSeverity_(rule) {
+  switch (rule.checkType) {
+    case '数値照合':
+      return isLookupLikeRule_(rule) ? '要確認' : 'NG';
+
+    case '文字列照合':
+      return 'NG';
+
+    case '空欄チェック':
+    case '条件付空欄チェック':
+    case '見出し存在チェック':
+    case '存在チェック':
+      return '要確認';
+
+    case '固定値照合':
+      return 'NG';
+
+    default:
+      return '要確認';
+  }
+}
+
+/**
+ * 空欄時のメッセージ自動生成
+ */
+function buildDefaultMessage_(rule) {
+  const srcSheet = normalizeSheetLabel_(rule.srcSheet);
+  const dstSheet = normalizeSheetLabel_(rule.dstSheet);
+  const item = rule.srcItem || rule.dstItem || '対象項目';
+  const conditionText = toNaturalCondition_(rule.conditionExpr);
+
+  // 表示用ラベル
+  const itemLabel = `【対象項目】${item}`;
+  const sheetLabel = srcSheet ? `【帳票】${srcSheet}` : '';
+
+  switch (rule.checkType) {
+
+    case '空欄チェック':
+      return `${itemLabel}${sheetLabel}
+${item}が未入力です。記載漏れの可能性があります。申告書の該当項目を確認してください。`;
+
+    case '条件付空欄チェック':
+      return `${itemLabel}${sheetLabel}
+${conditionText ? conditionText + 'にもかかわらず、' : ''}${item}が未入力です。申告書の記載内容を確認してください。`;
+
+    case '数値照合':
+      if (isLookupLikeRule_(rule)) {
+        return `${itemLabel}${sheetLabel}
+${item}について内訳書との一致確認ができませんでした。対象箇所の特定または記載内容を確認してください。`;
+      }
+
+      if (srcSheet && dstSheet) {
+        return `${itemLabel}【帳票】${srcSheet}⇔${dstSheet}
+${item}が一致していません。転記ミスまたは集計誤りの可能性があります。申告書を確認してください。`;
+      }
+
+      return `${itemLabel}${sheetLabel}
+${item}に差異があります。転記ミスまたは集計誤りの可能性があります。申告書を確認してください。`;
+
+    case '文字列照合':
+      return `${itemLabel}${sheetLabel}
+${item}の記載内容が一致していません。申告書の内容を確認してください。`;
+
+    case '固定値照合':
+      return `${itemLabel}${sheetLabel}
+${item}の記載内容が想定値と異なります。最新情報へ修正されているか確認してください。`;
+
+    case '見出し存在チェック':
+      return `${itemLabel}${sheetLabel}
+${item}が見当たりません。申告書が正しく作成されているか確認してください。`;
+
+    case '存在チェック':
+      return `${itemLabel}${sheetLabel}
+${item}が確認できませんでした。申告書の記載内容を確認してください。`;
+
+    default:
+      return `${itemLabel}${sheetLabel}
+${item}について確認が必要です。申告書を確認してください。`;
+  }
+}
+
+/**
+ * LOOKUP系かどうか
+ */
+function isLookupLikeRule_(rule) {
+  const dstExpr = String(rule.dstExpr || '').trim().toUpperCase();
+  const dstSheet = String(rule.dstSheet || '').trim();
+  return dstExpr.indexOf('LOOKUP:') === 0 || dstSheet.indexOf('内訳') >= 0;
+}
+
+/**
+ * シート名の見せ方調整
+ */
+function normalizeSheetLabel_(sheetName) {
+  const s = String(sheetName || '').trim();
+  if (!s) return '';
+
+  if (s.indexOf('法人事業概況説明書') >= 0) return '概況書';
+  if (s.indexOf('決算書') >= 0) return '決算書';
+  if (s.indexOf('内訳') >= 0) return '内訳書';
+
+  return s;
+}
+
+/**
+ * 条件式を人向け文言に変換
+ * 例: 従業員給与>0 -> 従業員給与が計上されている
+ */
+function toNaturalCondition_(expr) {
+  const s = String(expr || '').trim();
+  if (!s) return '';
+
+  let m = s.match(/^(.+)\s*>\s*0$/);
+  if (m) return `${m[1].trim()}が計上されている`;
+
+  m = s.match(/^(.+)\s*>=\s*1$/);
+  if (m) return `${m[1].trim()}がある`;
+
+  m = s.match(/^(.+)\s*=\s*TRUE$/i);
+  if (m) return `${m[1].trim()}に該当する`;
+
+  return `条件（${s}）
+  に該当する`;
+}
