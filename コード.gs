@@ -1004,6 +1004,7 @@ function resolveRuleSideValue_(ss, rule, side, ctx) {
 
   if (agg === '項目値') agg = 'FIRST';
   if (agg === '項目値あり') agg = 'FIRST_PRESENCE';
+  if (agg === '行があれば必須') agg = 'REQUIRED_IF_ANY_ROW';
   if (agg === '見出し下合計') agg = 'SUM_BELOW_HEADER';
   if (agg === '科目別合計') agg = 'SUM_BY_ACCOUNT';
   if (agg === '科目正規化後の科目別合計') agg = 'SUM_BY_ACCOUNT_NORMALIZED';
@@ -1137,6 +1138,19 @@ function resolveRuleSideValue_(ss, rule, side, ctx) {
     };
   }
 
+  if (agg === 'REQUIRED_IF_ANY_ROW') {
+    if (!found) return { value: null, sheetName: sheet.getName(), a1: '' };
+    const requiredColIndex = found.col;
+    const triggerColIndex = accountCol ? colToIndex_(accountCol) : 0;
+    const check = checkRequiredColumnIfAnyRow_(values, found.row, triggerColIndex, requiredColIndex);
+
+    return {
+      value: check.isValid ? 'OK' : '',
+      sheetName: sheet.getName(),
+      a1: check.a1,
+    };
+  }
+
   if (agg === 'FIRST') {
     if (!found) return { value: null, sheetName: sheet.getName(), a1: '' };
 
@@ -1264,6 +1278,38 @@ function resolveSheetFirstExpressionValue_(values, expr, amountCol) {
     value: foundAny ? total : null,
     a1: firstA1,
   };
+}
+
+function checkRequiredColumnIfAnyRow_(values, headerRow, triggerColIndex, requiredColIndex) {
+  if (!values || values.length === 0) {
+    return { isValid: true, a1: '' };
+  }
+
+  const safeTriggerCol = triggerColIndex >= 0 ? triggerColIndex : 0;
+  const safeRequiredCol = requiredColIndex >= 0 ? requiredColIndex : 0;
+  let hasTargetRows = false;
+
+  for (let r = headerRow + 1; r < values.length; r++) {
+    const row = values[r] || [];
+    const trigger = String(row[safeTriggerCol] || '').trim();
+    if (!trigger) continue;
+
+    hasTargetRows = true;
+
+    const required = String(row[safeRequiredCol] || '').trim();
+    if (!required) {
+      return {
+        isValid: false,
+        a1: toA1_(r + 1, safeRequiredCol + 1),
+      };
+    }
+  }
+
+  if (!hasTargetRows) {
+    return { isValid: true, a1: '' };
+  }
+
+  return { isValid: true, a1: '' };
 }
 
 function shouldApplyKiloScale_(rule, side, sideKeyRaw) {
@@ -1904,31 +1950,48 @@ JSONだけ返してください。
     }
   };
 
-  const res = UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
+  const maxAttempts = 4;
+  const baseSleepMs = 800;
 
-  const code = res.getResponseCode();
-  const body = res.getContentText();
+  let lastCode = 0;
+  let lastBody = '';
 
-  if (code < 200 || code >= 300) {
-    throw new Error(`Gemini API error ${code}: ${body}`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+
+    const code = res.getResponseCode();
+    const body = res.getContentText();
+    lastCode = code;
+    lastBody = body;
+
+    if (code >= 200 && code < 300) {
+      const json = JSON.parse(body);
+      const textOut = json.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!textOut) throw new Error('Gemini応答が空です');
+
+      const parsed = parseGeminiJsonResponse_(textOut);
+
+      return {
+        is_suspicious: !!parsed.is_suspicious,
+        reason: parsed.reason || '',
+        suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions.slice(0, 2) : []
+      };
+    }
+
+    if (!shouldRetryGeminiError_(code, body) || attempt === maxAttempts) {
+      break;
+    }
+
+    const sleepMs = baseSleepMs * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 250);
+    Utilities.sleep(sleepMs);
   }
 
-  const json = JSON.parse(body);
-  const textOut = json.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!textOut) throw new Error('Gemini応答が空です');
-
-  const parsed = parseGeminiJsonResponse_(textOut);
-
-  return {
-    is_suspicious: !!parsed.is_suspicious,
-    reason: parsed.reason || '',
-    suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions.slice(0, 2) : []
-  };
+  throw new Error(`Gemini API error ${lastCode}: ${summarizeGeminiError_(lastBody)}`);
 }
 
 function parseGeminiJsonResponse_(textOut) {
@@ -1965,6 +2028,30 @@ function callGeminiBreakdownCheckSafe_(text, sheetName, aiStats) {
       reason: '',
       suggestions: []
     };
+  }
+}
+
+function shouldRetryGeminiError_(code, body) {
+  if (code === 429 || code === 503 || code === 504) return true;
+  const msg = normalizeText_(String(body || ''));
+  return (
+    msg.includes(normalizeText_('帯域幅の上限')) ||
+    msg.includes(normalizeText_('resource_exhausted')) ||
+    msg.includes(normalizeText_('rate limit')) ||
+    msg.includes(normalizeText_('quota'))
+  );
+}
+
+function summarizeGeminiError_(body) {
+  const text = String(body || '');
+  const noApiKey = text.replace(/key=[^&"\s]+/gi, 'key=***');
+
+  try {
+    const json = JSON.parse(noApiKey);
+    const msg = json?.error?.message || json?.message || noApiKey;
+    return String(msg).slice(0, 400);
+  } catch (e) {
+    return noApiKey.slice(0, 400);
   }
 }
 
