@@ -1,52 +1,60 @@
 /*************************************************
- * 決算チェックツール 完全版
- * v2026-04-11.03
+ * 決算チェックツール 安全統合版
+ * v2026-04-15.05
  *
- * できること
- * - DriveフォルダIDを受け取り、同じフォルダに結果スプレッドシートを作成
- * - テンプレート（このGASが紐づくスプレッドシート）を丸ごとコピー
- * - フォルダ内の Googleスプレッドシート / Excel を取り込み
- * - 変換に使った一時スプレッドシートと元Excelを old フォルダへ移動（設定で切替）
- * - rules_main / rules_kokyo に基づいて照合
- * - check_result / check_log / report_A4 を出力
- * - 入力値の全般異常チェック + Gemini補助判定
- * - 概況書の MATCH_DECISION_EXPR, account_match_mode, value_pick_rule 対応
- * - MATCH_BREAKDOWN_LOOKUP 対応
- * - lookup_value_col の K+L のような複数列合算対応
- * - 決算書BS主要科目の未照合チェック
+ * 方針
+ * - 起動 / フォルダ取込 / old移動 は既存版を踏襲
+ * - ルール部分のみ 新_統合ルール / 新_検索定義 に差し替え
+ * - 日本語列名ベースで運用しやすくする
+ *
+ * 前提シート
+ * - 決算書
+ * - 新_統合ルール
+ * - 新_検索定義
+ * - 新_科目グループ
+ * - 新_科目正規化
+ * - 新_除外科目
+ * - 新_AIチェック対象（任意）
+ *
+ * スクリプトプロパティ（任意）
+ * - GEMINI_API_KEY
+ * - GEMINI_MODEL
+ * - AI_CHECK_ENABLED = true / false
+ * - MOVE_EXCEL_TO_OLD = true / false
+ * - MOVE_CONVERTED_TO_OLD = true / false
  *
  * 注意
- * - PDFのOCR読取はこの版では未実装
- * - 決算書は「決算書」というシート名で結果ブックに入る前提
- * - Advanced Drive API を ON にしてください
- * - スクリプトプロパティ（任意）:
- *     GEMINI_API_KEY = Gemini API Key
- *     AI_CHECK_ENABLED = true / false
- *     MOVE_EXCEL_TO_OLD = true / false
- *     MOVE_CONVERTED_TO_OLD = true / false
+ * - Excel取込のため Advanced Drive API を ON にしてください
+ * - ルールシートの加減算記号は半角 + - を使用してください
  *************************************************/
+
+
 
 const CONFIG = {
   TEMPLATE_SHEET_ID: '',
   RESULT_FILE_PREFIX: '決算チェック_',
 
   SHEET_DECISION: '決算書',
-  SHEET_RULES_MAIN: 'rules_main',
-  SHEET_RULES_KOKYO: 'rules_kokyo',
-  SHEET_GROUP_MASTER: 'account_group_master',
-  SHEET_NORMALIZE_MASTER: 'account_normalize_master',
-  SHEET_EXCLUDE_MASTER: 'account_exclude_master',
-  SHEET_AI_TARGETS: 'ai_check_targets',
 
-  SHEET_KOKYO_FRONT: '概況書表面',
-  SHEET_KOKYO_BACK: '概況書裏面',
+  SHEET_RULES: '新_統合ルール',
+  SHEET_LOOKUP: '新_検索定義',
+  SHEET_GROUP_MASTER: '新_科目グループ',
+  SHEET_NORMALIZE_MASTER: '新_科目正規化',
+  SHEET_EXCLUDE_MASTER: '新_除外科目',
+  SHEET_AI_TARGETS: '新_AIチェック対象',
 
   SHEET_RESULT: 'check_result',
   SHEET_LOG: 'check_log',
   SHEET_ACCOUNT_MATCH_LOG: 'account_match_log',
+  SHEET_AI_CHECK_LOG: 'ai_check_log',
   SHEET_REPORT: 'report_A4',
+
   AI_CHECK_START_ROW: 5,
 };
+
+/* =========================
+ * メニュー
+ * ========================= */
 
 function onOpen() {
   SpreadsheetApp.getUi()
@@ -72,12 +80,20 @@ function doGet(e) {
   }
 
   if (action === 'run') {
-    const result = runFromFolder_(folderId);
-    return HtmlService
-      .createHtmlOutput(
-        `<p>処理が完了しました。</p><p><a href="${result.url}" target="_blank">結果スプレッドシートを開く</a></p>`
-      )
-      .setTitle('決算チェック');
+    try {
+      const result = runFromFolder_(folderId);
+      return HtmlService
+        .createHtmlOutput(
+          `<p>処理が完了しました。</p><p><a href="${result.url}" target="_blank">結果スプレッドシートを開く</a></p>`
+        )
+        .setTitle('決算チェック');
+    } catch (err) {
+      return HtmlService
+        .createHtmlOutput(
+          `<p>エラーが発生しました。</p><pre>${escapeHtml_(String(err && err.stack ? err.stack : err))}</pre>`
+        )
+        .setTitle('決算チェック');
+    }
   }
 
   return ContentService.createTextOutput('no action');
@@ -184,66 +200,130 @@ function createResultSpreadsheetFromTemplate_(templateSs, folder) {
 
 function importFilesFromFolder_(folder, oldFolder, resultSs) {
   const files = folder.getFiles();
+  const templateId = getTemplateSpreadsheet_().getId();
+  let fileCount = 0;
+  let importedGoogleCount = 0;
+  let importedExcelCount = 0;
+  let skippedCount = 0;
+
+  appendLogRow_(resultSs, `取込開始: folder=${folder.getName()} (${folder.getId()})`);
 
   while (files.hasNext()) {
     const file = files.next();
+    fileCount++;
+
     const fileId = file.getId();
     const fileName = file.getName();
     const mimeType = file.getMimeType();
 
-    if (fileId === resultSs.getId()) continue;
-    if (fileId === getTemplateSpreadsheet_().getId()) continue;
-    if (fileName === 'old') continue;
+    appendLogRow_(resultSs, `検出: name=${fileName} / mimeType=${mimeType}`);
 
-    if (mimeType === MimeType.GOOGLE_SHEETS) {
-      importGoogleSpreadsheetFile_(file, resultSs);
+    if (fileId === resultSs.getId()) {
+      appendLogRow_(resultSs, `除外: 結果ブック ${fileName}`);
+      skippedCount++;
       continue;
     }
 
-    if (isExcelMimeType_(mimeType) || /\.xlsx?$/i.test(fileName)) {
+    if (fileId === templateId) {
+      appendLogRow_(resultSs, `除外: テンプレート ${fileName}`);
+      skippedCount++;
+      continue;
+    }
+
+    if (fileName === 'old') {
+      appendLogRow_(resultSs, `除外: old`);
+      skippedCount++;
+      continue;
+    }
+
+    if (mimeType === MimeType.GOOGLE_SHEETS) {
+      importGoogleSpreadsheetFile_(file, resultSs);
+      importedGoogleCount++;
+      appendLogRow_(resultSs, `Googleスプレッドシート取込: ${fileName}`);
+      continue;
+    }
+
+    if (isExcelFile_(file)) {
       importExcelFile_(file, folder, oldFolder, resultSs);
+      importedExcelCount++;
+      appendLogRow_(resultSs, `Excel取込完了: ${fileName}`);
       continue;
     }
 
     if (mimeType === MimeType.PDF || /\.pdf$/i.test(fileName)) {
       appendLogRow_(resultSs, `PDFは未取込（OCR未実装）: ${fileName}`);
+      skippedCount++;
       continue;
     }
+
+    appendLogRow_(resultSs, `未対応形式のためスキップ: ${fileName}`);
+    skippedCount++;
   }
+
+  appendLogRow_(
+    resultSs,
+    `取込完了: 総件数=${fileCount}, Googleスプレッドシート=${importedGoogleCount}, Excel=${importedExcelCount}, スキップ=${skippedCount}`
+  );
 }
 
 function importGoogleSpreadsheetFile_(file, resultSs) {
   const sourceSs = SpreadsheetApp.openById(file.getId());
   copySourceSheets_(sourceSs, resultSs, file.getName());
-  appendLogRow_(resultSs, `Googleスプレッドシート取込: ${file.getName()}`);
 }
 
 function importExcelFile_(file, folder, oldFolder, resultSs) {
   const moveExcelToOld = getMoveExcelToOldFlag_();
   const moveConvertedToOld = getMoveConvertedToOldFlag_();
+  const fileName = file.getName();
+
+  appendLogRow_(resultSs, `Excel変換開始: ${fileName}`);
 
   const tempSs = convertExcelToSpreadsheet_(file, folder);
 
+  if (!tempSs) {
+    throw new Error(`Excel変換に失敗しました: ${fileName}`);
+  }
+
   try {
-    copySourceSheets_(tempSs, resultSs, file.getName());
-    appendLogRow_(resultSs, `Excel取込: ${file.getName()}`);
+    appendLogRow_(resultSs, `Excel変換成功: ${fileName} -> ${tempSs.getName()} (${tempSs.getId()})`);
+    copySourceSheets_(tempSs, resultSs, fileName);
+    appendLogRow_(resultSs, `Excelシート統合完了: ${fileName}`);
   } finally {
-    moveFileToOldIfNeeded_(file, oldFolder, moveExcelToOld);
-    moveFileToOldIfNeeded_(DriveApp.getFileById(tempSs.getId()), oldFolder, moveConvertedToOld);
+    try {
+      moveFileToOldIfNeeded_(file, oldFolder, moveExcelToOld);
+      appendLogRow_(resultSs, `元Excel old移動: ${fileName} / enabled=${moveExcelToOld}`);
+    } catch (e1) {
+      appendLogRow_(resultSs, `元Excel old移動失敗: ${fileName} / ${e1.message}`);
+    }
+
+    try {
+      moveFileToOldIfNeeded_(DriveApp.getFileById(tempSs.getId()), oldFolder, moveConvertedToOld);
+      appendLogRow_(resultSs, `変換後スプレッドシート old移動: ${tempSs.getName()} / enabled=${moveConvertedToOld}`);
+    } catch (e2) {
+      appendLogRow_(resultSs, `変換後スプレッドシート old移動失敗: ${fileName} / ${e2.message}`);
+    }
   }
 }
 
 function convertExcelToSpreadsheet_(file, folder) {
   const blob = file.getBlob();
+  const fileName = file.getName();
 
   const resource = {
-    title: `[tmp]${file.getName()}`,
+    title: `[tmp]${fileName}`,
     mimeType: MimeType.GOOGLE_SHEETS,
     parents: [{ id: folder.getId() }],
   };
 
-  const converted = Drive.Files.insert(resource, blob);
-  return SpreadsheetApp.openById(converted.id);
+  try {
+    const converted = Drive.Files.insert(resource, blob);
+    if (!converted || !converted.id) {
+      throw new Error('Drive.Files.insert の戻り値に id がありません');
+    }
+    return SpreadsheetApp.openById(converted.id);
+  } catch (e) {
+    throw new Error(`Excel変換エラー: ${fileName} / ${e.message}`);
+  }
 }
 
 function copySourceSheets_(sourceSs, targetSs, sourceFileName) {
@@ -275,15 +355,32 @@ function buildImportedSheetName_(fileName, originalSheetName, multiple, index) {
 }
 
 function stripExtension_(name) {
-  return String(name || '').replace(/\.[^/.]+$/,'');
+  return String(name || '').replace(/\.[^/.]+$/, '');
 }
 
 function isExcelMimeType_(mimeType) {
+  const s = String(mimeType || '');
   return [
     MimeType.MICROSOFT_EXCEL,
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     'application/vnd.ms-excel',
-  ].includes(mimeType);
+    'application/vnd.ms-excel.sheet.macroenabled.12',
+    'application/vnd.ms-excel.sheet.binary.macroenabled.12',
+    'application/octet-stream'
+  ].includes(s);
+}
+
+function isExcelFile_(file) {
+  const fileName = String(file.getName() || '');
+  const mimeType = String(file.getMimeType() || '');
+
+  return (
+    isExcelMimeType_(mimeType) ||
+    /\.xlsx$/i.test(fileName) ||
+    /\.xls$/i.test(fileName) ||
+    /\.xlsm$/i.test(fileName) ||
+    /\.xlsb$/i.test(fileName)
+  );
 }
 
 /* =========================
@@ -307,21 +404,21 @@ function runChecksCore_(ss) {
 
     const ctx = buildContext_(ss);
 
-    const mainResults = runMainRules_(ss, ctx);
-    const kokyoResults = runKokyoRules_(ss, ctx);
+    const ruleResults = runUnifiedRules_(ss, ctx);
     const aiCheckEnabled = getAiCheckEnabledFlag_();
     const typoResults = aiCheckEnabled ? runGlobalInputAnomalyChecks_(ss) : [];
     if (!aiCheckEnabled) {
       appendLogRow_(ss, 'AI入力値チェックをスキップしました（AI_CHECK_ENABLED=false）');
     }
+
     writeAccountMatchLog_(ss, ctx);
     const bsUnusedResults = buildUnusedBSAccountResults_(ctx);
 
-    const allResults = [...mainResults, ...kokyoResults, ...typoResults, ...bsUnusedResults];
+    const allResults = [...ruleResults, ...typoResults, ...bsUnusedResults];
     writeResults_(ss, allResults);
     buildA4Report_(ss);
 
-    appendLogRow_(ss, `照合完了 件数=${allResults.length}`);
+    appendLogRow_(ss, `照合完了 件数=${(allResults || []).filter(r => r != null).length}`);
   } catch (err) {
     appendLogRow_(ss, `ERROR: ${err.stack || err}`);
     throw err;
@@ -374,9 +471,25 @@ function resetResultSheetsInSpreadsheet_(ss) {
     '備考'
   ]]);
 
+  const aiLog = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_AI_CHECK_LOG);
+  aiLog.clearContents().clearFormats();
+  aiLog.getRange(1, 1, 1, 7).setValues([[
+    '日時',
+    'シート名',
+    'セル',
+    '入力値',
+    '取得元',
+    'AI判定',
+    'AI理由'
+  ]]);
+
   const report = ss.getSheetByName(CONFIG.SHEET_REPORT);
   if (report) ss.deleteSheet(report);
 }
+
+/* =========================
+ * Context
+ * ========================= */
 
 function buildContext_(ss) {
   const decisionSheet = getRequiredSheet_(ss, CONFIG.SHEET_DECISION);
@@ -385,973 +498,904 @@ function buildContext_(ss) {
   return {
     ss,
     decisionSheet,
-    decisionValues: decisionSheet.getDataRange().getValues(),
+    decisionValues: decisionSheet.getDataRange().getDisplayValues(),
     decisionMap: parsed.map,
     bsAccounts: parsed.bsAccounts,
     usedDecisionAccounts: new Set(),
-    groups: loadGroupMaster_(ss),
-    normalizeRules: loadNormalizeMaster_(ss),
-    excludeMaster: loadExcludeMaster_(ss),
-    rulesMain: loadRulesMain_(ss),
-    rulesKokyo: loadRulesKokyo_(ss),
-    trackDecisionUsage: false,
+
+    rules: loadUnifiedRules_(ss),
+    lookupMaster: loadLookupMaster_(ss),
+    groups: loadGroupMasterJa_(ss),
+    normalizeRules: loadNormalizeMasterJa_(ss),
+    excludeMaster: loadExcludeMasterJa_(ss),
+
+    trackDecisionUsage: true,
   };
 }
 
-function buildUnusedBSAccountResults_(ctx) {
-  const results = [];
-  const excludedAccounts = new Set([
-    normalizeText_('普通預金'),
-    normalizeText_('未払消費税等'),
-    normalizeText_('未払法人税等')
-  ]);
-
-  ctx.bsAccounts.forEach(account => {
-    const a = normalizeText_(account);
-    if (!a) return;
-    if (excludedAccounts.has(a)) return;
-
-    const isUnused = !ctx.usedDecisionAccounts.has(a);
-    const note = isUnused ? '内訳書照合で未使用' : '';
-    const decisionValue = toNumber_(ctx.decisionMap[a]);
-    const hasAmount = decisionValue != null && decisionValue >= 1;
-    const hasUnusedNote = note.includes('内訳書照合で未使用');
-
-    if (isUnused && hasAmount && hasUnusedNote) {
-      results.push(makeResult_({
-        status: '要確認',
-        category: '未照合BS科目',
-        ruleId: 'BS001',
-        sheetName: CONFIG.SHEET_DECISION,
-        itemName: a,
-        targetCell: '',
-        jumpUrl: '',
-        decisionValue: decisionValue,
-        compareValue: '',
-        diff: '',
-        condition: 'UNUSED_BS_ACCOUNT',
-        message: '決算書のBS科目ですが、今回どの内訳書照合にも使用されていません',
-        detail: '',
-      }));
-    }
-  });
-
-  return results;
-}
-
-function writeAccountMatchLog_(ss, ctx) {
-  const sheet = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_ACCOUNT_MATCH_LOG);
-  sheet.clearContents().clearFormats();
-  sheet.getRange(1, 1, 1, 6).setValues([[
-    'No',
-    '勘定科目',
-    '決算書値',
-    '照合利用有無',
-    '対象レンジ内',
-    '備考'
-  ]]);
-
-  const rows = (ctx.bsAccounts || []).map((account, idx) => {
-    const key = normalizeText_(account);
-    const used = key ? ctx.usedDecisionAccounts.has(key) : false;
-    return [
-      idx + 1,
-      key || '',
-      key ? (ctx.decisionMap[key] != null ? ctx.decisionMap[key] : '') : '',
-      used ? '照合済み' : '未照合',
-      '対象',
-      used ? '' : '内訳書照合で未使用'
-    ];
-  });
-
-  if (rows.length > 0) {
-    sheet.getRange(2, 1, rows.length, 6).setValues(rows);
-  }
-}
-
 /* =========================
- * rules_main
+ * 統合ルール読込
  * ========================= */
 
-function runMainRules_(ss, ctx) {
-  const results = [];
-  ctx.trackDecisionUsage = true;
-
-  for (const rule of ctx.rulesMain) {
-    if (!toBoolean_(rule.enabled)) continue;
-    const checkType = normalizeCheckType_(rule.check_type || rule.checktype || rule['check type']);
-
-    const targetSheet = findTargetSheetByPattern_(ss, rule.file_pattern);
-    if (!targetSheet) {
-      results.push(makeResult_({
-        status: '要確認',
-        category: '内訳書',
-        ruleId: rule.rule_id,
-        sheetName: '',
-        itemName: rule.document_type,
-        targetCell: '',
-        jumpUrl: '',
-        decisionValue: '',
-        compareValue: '',
-        diff: '',
-        condition: 'シート未検出',
-        message: `対象シートが見つかりません: ${rule.file_pattern}`,
-        detail: '',
-      }));
-      continue;
-    }
-
-    const sheetData = getSheetValues_(targetSheet);
-    const rows = sheetData.values;
-    const display = sheetData.displayValues;
-
-    try {
-      switch (checkType) {
-        case 'SUM_MATCH':
-          results.push(...checkSumMatch_(rule, targetSheet, rows, ctx));
-          break;
-        case 'SUM_BY_ACCOUNT':
-          results.push(...checkSumByAccount_(rule, targetSheet, rows, ctx));
-          break;
-        case 'GROUP_SUM':
-          results.push(...checkGroupSum_(rule, targetSheet, rows, ctx));
-          break;
-        case 'FIXED_VALUE':
-          results.push(...checkFixedValue_(rule, targetSheet, display, ctx));
-          break;
-        case 'NOT_BLANK_WHEN_PRESENT':
-          results.push(...checkNotBlankWhenPresent_(rule, targetSheet, display, ctx));
-          break;
-        case 'NOT_BLANK_WHEN_ROW_EXISTS':
-          results.push(...checkNotBlankWhenRowExists_(rule, targetSheet, display, ctx));
-          break;
-        case 'NOT_BLANK_WHEN_AMOUNT_EXISTS':
-          results.push(...checkNotBlankWhenAmountExists_(rule, targetSheet, rows, ctx));
-          break;
-        case 'HEADER_CHECK':
-          results.push(...checkHeader_(rule, targetSheet, display, ctx));
-          break;
-        case 'TITLE_CHECK':
-          results.push(...checkTitle_(rule, targetSheet, display, ctx));
-          break;
-        case 'NORMALIZE_SUM':
-          results.push(...checkNormalizeSum_(rule, targetSheet, rows, ctx));
-          break;
-        default:
-          results.push(makeResult_({
-            status: '要確認',
-            category: '内訳書',
-            ruleId: rule.rule_id,
-            sheetName: targetSheet.getName(),
-            itemName: rule.document_type,
-            targetCell: '',
-            jumpUrl: '',
-            decisionValue: '',
-            compareValue: '',
-            diff: '',
-            condition: checkType || '',
-            message: `未対応のcheck_typeです: ${checkType || '(空欄)'}`,
-            detail: '',
-          }));
-      }
-    } catch (err) {
-      results.push(makeResult_({
-        status: '要確認',
-        category: '内訳書',
-        ruleId: rule.rule_id,
-        sheetName: targetSheet.getName(),
-        itemName: rule.document_type,
-        targetCell: '',
-        jumpUrl: '',
-        decisionValue: '',
-        compareValue: '',
-        diff: '',
-        condition: '実行エラー',
-        message: `ルール実行中にエラー: ${err.message}`,
-        detail: err.stack || '',
-      }));
-    }
-  }
-  ctx.trackDecisionUsage = false;
-
-  return results;
-}
-
-function checkSumMatch_(rule, sheet, rows, ctx) {
-  let amountCol = colToIndex_(rule.amount_col);
-  let headerRow = findHeaderRowByText_(rows, rule.header_name, amountCol);
-
-  if (headerRow < 0) {
-    const found = findCellByText_(sheet.getDataRange().getDisplayValues(), rule.header_name);
-    if (found) {
-      headerRow = found.row;
-      amountCol = found.col;
-    }
+function loadUnifiedRules_(ss) {
+  const sheet = getRequiredSheet_(ss, CONFIG.SHEET_RULES);
+  const rows = loadRowsAsObjectsJapanese_(sheet);
+  
+  const headerRow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+  if (headerRow.indexOf('ルールID') === -1) {
+  appendLogRow_(ss, '警告: 新_統合ルール のヘッダーに「ルールID」がありません。ヘッダー崩れの可能性があります。');
   }
 
-  if (headerRow < 0) return [ngHeaderNotFound_(rule, sheet)];
+  const mapped = rows
+    .map((r, idx) => {
+      const fallbackRuleId =
+        String(r['ルールID'] || '').trim() ||
+        String(r['照合先の値'] || '').trim(); // ヘッダー崩れ時の救済
 
-  const sum = sumColumnBelowHeader_(rows, headerRow, amountCol);
-  const target = resolveDecisionTargetValue_(rule, ctx);
-  const a1 = toA1_(headerRow + 1, amountCol + 1);
+      return {
+        rule_id: fallbackRuleId,
+        enabled: toBooleanJa_(r['有効']),
+        check_type: normalizeCheckTypeJa_(r['チェック種別']),
+        category: String(r['区分'] || '').trim(),
 
-  return [compareNumbersResult_(rule, sheet.getName(), rule.header_name || rule.target_account || rule.target_account_group, target, sum, '内訳書', a1, buildRangeUrl_(ctx.ss, sheet.getName(), a1))];
-}
+        src_sheet: String(r['照合元シート名（部分一致）'] || r['照合元シート名'] || '').trim(),
+        src_key: String(r['照合元項目・見出し'] || r['照合元項目名'] || '').trim(),
+        src_account_col: String(r['照合元科目列'] || '').trim(),
+        src_amount_col: String(r['照合元金額列'] || '').trim(),
+        src_agg: String(r['照合元集計方法'] || '').trim(),
+        src_value_expr: String(r['照合元値指定'] || '').trim(),
 
-function checkSumByAccount_(rule, sheet, rows, ctx) {
-  const accountCol = colToIndex_(rule.account_col);
-  let amountCol = colToIndex_(rule.amount_col);
+        dst_sheet: String(r['照合先シート名（部分一致）'] || r['照合先シート名'] || '').trim(),
+        dst_key: String(r['照合先項目・見出し'] || r['照合先項目名'] || '').trim(),
+        dst_account_col: String(r['照合先科目列'] || '').trim(),
+        dst_amount_col: String(r['照合先金額列'] || '').trim(),
+        dst_agg: String(r['照合先集計方法'] || '').trim(),
+        dst_value_expr: String(r['照合先値指定'] || '').trim(),
 
-  let headerRow = findHeaderRowByText_(rows, rule.header_name, amountCol);
+        condition_expr: String(r['条件式'] || '').trim(),
+        match_mode: String(r['一致方法'] || '').trim(),
+        lookup_id: String(r['検索定義ID'] || '').trim(),
 
-  if (normalizeText_(rule.file_pattern).includes('売掛金の内訳')) {
-    const accountHeaderRow = findHeaderRowByText_(rows, '種類', accountCol);
-    if (accountHeaderRow >= 0) headerRow = accountHeaderRow;
-  }
+        severity: String(r['重要度'] || '要確認').trim(),
+        message: String(r['メッセージ'] || '').trim(),
+        note: String(r['移行メモ'] || '').trim(),
+        __row_index: idx + 2,
+      };
+    })
+    .filter(rule => rule.rule_id);
 
-  if (headerRow < 0) {
-    const found = findCellByText_(sheet.getDataRange().getDisplayValues(), rule.header_name);
-    if (found) {
-      headerRow = found.row;
-      amountCol = found.col;
-    }
-  }
+  const deduped = [];
+  const seen = new Set();
+  let headerLikeSkipped = 0;
+  let duplicatedSkipped = 0;
 
-  if (headerRow < 0) return [ngHeaderNotFound_(rule, sheet)];
-
-  const exclude = mergeExcludeAccounts_(rule.exclude_accounts, ctx.excludeMaster);
-  const sums = {};
-  const rowMap = {};
-
-  for (let r = headerRow + 1; r < rows.length; r++) {
-    const account = normalizeText_(rows[r][accountCol]);
-    if (!account) continue;
-    if (isSectionLike_(account)) continue;
-    if (exclude.has(account)) continue;
-
-    const amount = toNumber_(rows[r][amountCol]);
-    if (amount == null) continue;
-
-    sums[account] = (sums[account] || 0) + amount;
-    if (!rowMap[account]) rowMap[account] = r;
-  }
-
-  const results = [];
-  Object.keys(sums).sort().forEach(account => {
-    markDecisionAccountUsed_(ctx, account);
-
-    const a1 = toA1_(rowMap[account] + 1, amountCol + 1);
-    const jumpUrl = buildRangeUrl_(ctx.ss, sheet.getName(), a1);
-    const decisionValue = ctx.decisionMap[account];
-
-    if (decisionValue == null) {
-      results.push(makeResult_({
-        status: 'SKIP',
-        category: '内訳書',
-        ruleId: rule.rule_id,
-        sheetName: sheet.getName(),
-        itemName: account,
-        targetCell: a1,
-        jumpUrl: jumpUrl,
-        decisionValue: '',
-        compareValue: sums[account],
-        diff: '',
-        condition: '決算書科目なし',
-        message: '決算書に対象科目が無いためスキップ',
-        detail: '',
-      }));
+  mapped.forEach(rule => {
+    if (isHeaderLikeUnifiedRule_(rule)) {
+      headerLikeSkipped++;
       return;
     }
 
-    results.push(compareNumbersResult_(rule, sheet.getName(), account, decisionValue, sums[account], '内訳書', a1, jumpUrl));
-  });
-
-  if (results.length === 0) {
-    results.push(makeResult_({
-      status: '要確認',
-      category: '内訳書',
-      ruleId: rule.rule_id,
-      sheetName: sheet.getName(),
-      itemName: rule.document_type,
-      targetCell: '',
-      jumpUrl: '',
-      decisionValue: '',
-      compareValue: '',
-      diff: '',
-      condition: '比較対象なし',
-      message: '決算書と一致判定できる科目が見つかりませんでした',
-      detail: '',
-    }));
-  }
-
-  return results;
-}
-
-function checkGroupSum_(rule, sheet, rows, ctx) {
-  const displayValues = sheet.getDataRange().getDisplayValues();
-
-  let amountCol = colToIndex_(rule.amount_col);
-  let headerRow = findHeaderRowByText_(displayValues, rule.header_name, amountCol);
-
-  if (headerRow < 0) {
-    const found = findCellByText_(displayValues, rule.header_name);
-    if (found) {
-      headerRow = found.row;
-      amountCol = found.col;
-    }
-  }
-
-  if (headerRow < 0) return [ngHeaderNotFound_(rule, sheet)];
-
-  const sum = sumColumnBelowHeader_(rows, headerRow, amountCol);
-  const target = resolveDecisionTargetValue_(rule, ctx);
-  const a1 = toA1_(headerRow + 1, amountCol + 1);
-
-  return [compareNumbersResult_(rule, sheet.getName(), rule.target_account_group || rule.header_name, target, sum, '内訳書', a1, buildRangeUrl_(ctx.ss, sheet.getName(), a1))];
-}
-
-function checkFixedValue_(rule, sheet, displayValues, ctx) {
-  const found = findCellByText_(displayValues, rule.header_name);
-  if (!found) {
-    return [makeResult_({
-      status: '要確認',
-      category: '内訳書',
-      ruleId: rule.rule_id,
-      sheetName: sheet.getName(),
-      itemName: rule.header_name,
-      targetCell: '',
-      jumpUrl: '',
-      decisionValue: '',
-      compareValue: '',
-      diff: '',
-      condition: '固定項目未検出',
-      message: `${rule.header_name} が見つかりません`,
-      detail: '',
-    })];
-  }
-
-  const value = findRightNumericValue_(displayValues, found.row, found.col);
-  const target = resolveDecisionTargetValue_(rule, ctx);
-  const a1 = toA1_(found.row + 1, found.col + 1);
-
-  return [compareNumbersResult_(rule, sheet.getName(), rule.header_name, target, value, '内訳書', a1, buildRangeUrl_(ctx.ss, sheet.getName(), a1))];
-}
-
-function checkNotBlankWhenPresent_(rule, sheet, displayValues, ctx) {
-  const found = findCellByText_(displayValues, rule.header_name);
-  if (!found) {
-    return [makeResult_({
-      status: '要確認',
-      category: '内訳書',
-      ruleId: rule.rule_id,
-      sheetName: sheet.getName(),
-      itemName: rule.header_name,
-      targetCell: '',
-      jumpUrl: '',
-      decisionValue: '',
-      compareValue: '',
-      diff: '',
-      condition: '固定項目未検出',
-      message: `${rule.header_name} が見つかりません`,
-      detail: '',
-    })];
-  }
-
-  const value = findRightTextValue_(displayValues, found.row, found.col);
-  const a1 = toA1_(found.row + 1, found.col + 1);
-
-  return [makeResult_({
-    status: value ? 'OK' : (rule.severity || '要確認'),
-    category: '内訳書',
-    ruleId: rule.rule_id,
-    sheetName: sheet.getName(),
-    itemName: rule.header_name,
-    targetCell: a1,
-    jumpUrl: buildRangeUrl_(ctx.ss, sheet.getName(), a1),
-    decisionValue: '',
-    compareValue: value || '',
-    diff: '',
-    condition: 'NOT_BLANK',
-    message: value ? 'OK' : rule.message,
-    detail: '',
-  })];
-}
-
-function checkNotBlankWhenAmountExists_(rule, sheet, rows, ctx) {
-  const amountCol = colToIndex_(rule.amount_col);
-  const targetBlankCol = colToIndex_('M');
-
-  let foundBlank = false;
-  let foundRow = -1;
-
-  for (let r = 0; r < rows.length; r++) {
-    const amount = toNumber_(rows[r][amountCol]);
-    if (amount != null && amount !== 0) {
-      const v = normalizeText_(rows[r][targetBlankCol]);
-      if (!v) {
-        foundBlank = true;
-        foundRow = r;
-        break;
-      }
-    }
-  }
-
-  const a1 = foundRow >= 0 ? toA1_(foundRow + 1, targetBlankCol + 1) : '';
-  return [makeResult_({
-    status: foundBlank ? (rule.severity || '要確認') : 'OK',
-    category: '内訳書',
-    ruleId: rule.rule_id,
-    sheetName: sheet.getName(),
-    itemName: rule.document_type,
-    targetCell: a1,
-    jumpUrl: a1 ? buildRangeUrl_(ctx.ss, sheet.getName(), a1) : '',
-    decisionValue: '',
-    compareValue: '',
-    diff: '',
-    condition: rule.condition || '',
-    message: foundBlank ? rule.message : 'OK',
-    detail: '',
-  })];
-}
-
-function checkNotBlankWhenRowExists_(rule, sheet, displayValues, ctx) {
-  const found = findCellByText_(displayValues, rule.header_name);
-  if (!found) {
-    return [makeResult_({
-      status: '要確認',
-      category: '内訳書',
-      ruleId: rule.rule_id,
-      sheetName: sheet.getName(),
-      itemName: rule.header_name,
-      targetCell: '',
-      jumpUrl: '',
-      decisionValue: '',
-      compareValue: '',
-      diff: '',
-      condition: '固定項目未検出',
-      message: `${rule.header_name} が見つかりません`,
-      detail: '',
-    })];
-  }
-
-  const targetCol = found.col;
-  const startRow = found.row + 1;
-  const triggerCols = parseColumnList_(rule.account_col || 'B');
-
-  let foundBlank = false;
-  let foundRow = -1;
-  for (let r = startRow; r < displayValues.length; r++) {
-    const hasTrigger = triggerCols.some(col => normalizeText_(displayValues[r][col]) !== '');
-    if (!hasTrigger) continue;
-
-    const targetText = normalizeText_(displayValues[r][targetCol]);
-    if (!targetText) {
-      foundBlank = true;
-      foundRow = r;
-      break;
-    }
-  }
-
-  const a1 = foundBlank ? toA1_(foundRow + 1, targetCol + 1) : '';
-  return [makeResult_({
-    status: foundBlank ? (rule.severity || '要確認') : 'OK',
-    category: '内訳書',
-    ruleId: rule.rule_id,
-    sheetName: sheet.getName(),
-    itemName: rule.header_name,
-    targetCell: a1,
-    jumpUrl: a1 ? buildRangeUrl_(ctx.ss, sheet.getName(), a1) : '',
-    decisionValue: '',
-    compareValue: '',
-    diff: '',
-    condition: 'NOT_BLANK_WHEN_ROW_EXISTS',
-    message: foundBlank ? rule.message : 'OK',
-    detail: '',
-  })];
-}
-
-function parseColumnList_(expr) {
-  const raw = String(expr || '').trim();
-  if (!raw) return [1]; // B
-  const parts = raw.split(/[+,]/).map(s => s.trim()).filter(Boolean);
-  const cols = parts
-    .map(p => colToIndex_(p))
-    .filter(i => i >= 0);
-  return cols.length ? cols : [1];
-}
-
-function checkHeader_(rule, sheet, displayValues, ctx) {
-  const found = findCellByText_(displayValues, rule.header_name);
-  const a1 = found ? toA1_(found.row + 1, found.col + 1) : '';
-
-  return [makeResult_({
-    status: found ? 'OK' : (rule.severity || 'NG'),
-    category: '内訳書',
-    ruleId: rule.rule_id,
-    sheetName: sheet.getName(),
-    itemName: rule.header_name,
-    targetCell: a1,
-    jumpUrl: a1 ? buildRangeUrl_(ctx.ss, sheet.getName(), a1) : '',
-    decisionValue: '',
-    compareValue: found ? rule.header_name : '',
-    diff: '',
-    condition: 'HEADER_CHECK',
-    message: found ? 'OK' : rule.message,
-    detail: '',
-  })];
-}
-
-function checkTitle_(rule, sheet, displayValues, ctx) {
-  const found = findCellByText_(displayValues, rule.header_name);
-  const a1 = found ? toA1_(found.row + 1, found.col + 1) : '';
-
-  return [makeResult_({
-    status: found ? 'OK' : (rule.severity || 'NG'),
-    category: '内訳書',
-    ruleId: rule.rule_id,
-    sheetName: sheet.getName(),
-    itemName: rule.header_name,
-    targetCell: a1,
-    jumpUrl: a1 ? buildRangeUrl_(ctx.ss, sheet.getName(), a1) : '',
-    decisionValue: '',
-    compareValue: found ? rule.header_name : '',
-    diff: '',
-    condition: 'TITLE_CHECK',
-    message: found ? 'OK' : rule.message,
-    detail: '',
-  })];
-}
-
-function checkNormalizeSum_(rule, sheet, rows, ctx) {
-  const accountCol = colToIndex_(rule.account_col);
-  let amountCol = colToIndex_(rule.amount_col);
-  let headerRow = findHeaderRowByText_(rows, rule.header_name, amountCol);
-
-  if (headerRow < 0) {
-    const found = findCellByText_(sheet.getDataRange().getDisplayValues(), rule.header_name);
-    if (found) {
-      headerRow = found.row;
-      amountCol = found.col;
-    }
-  }
-
-  if (headerRow < 0) return [ngHeaderNotFound_(rule, sheet)];
-
-  const sums = {};
-  const rowMap = {};
-
-  for (let r = headerRow + 1; r < rows.length; r++) {
-    const rawLabel = normalizeText_(rows[r][accountCol]);
-    if (!rawLabel) continue;
-
-    const normalizedAccount = normalizeAccountByRule_(rawLabel, ctx.normalizeRules) || rawLabel;
-    const amount = toNumber_(rows[r][amountCol]);
-    if (amount == null) continue;
-
-    sums[normalizedAccount] = (sums[normalizedAccount] || 0) + amount;
-    if (!rowMap[normalizedAccount]) rowMap[normalizedAccount] = r;
-  }
-
-  const results = [];
-  Object.keys(sums).sort().forEach(account => {
-    markDecisionAccountUsed_(ctx, account);
-
-    const decisionValue = ctx.decisionMap[account];
-    const a1 = toA1_(rowMap[account] + 1, amountCol + 1);
-    const jumpUrl = buildRangeUrl_(ctx.ss, sheet.getName(), a1);
-
-    if (decisionValue == null) {
-      results.push(makeResult_({
-        status: 'SKIP',
-        category: '内訳書',
-        ruleId: rule.rule_id,
-        sheetName: sheet.getName(),
-        itemName: account,
-        targetCell: a1,
-        jumpUrl: jumpUrl,
-        decisionValue: '',
-        compareValue: sums[account],
-        diff: '',
-        condition: '決算書科目なし',
-        message: '決算書に対象科目が無いためスキップ',
-        detail: '',
-      }));
+    const key = buildUnifiedRuleDedupKey_(rule);
+    if (seen.has(key)) {
+      duplicatedSkipped++;
       return;
     }
-
-    results.push(compareNumbersResult_(rule, sheet.getName(), account, decisionValue, sums[account], '内訳書', a1, jumpUrl));
+    seen.add(key);
+    deduped.push(rule);
   });
 
-  if (results.length === 0) {
-    results.push(makeResult_({
-      status: '要確認',
-      category: '内訳書',
-      ruleId: rule.rule_id,
-      sheetName: sheet.getName(),
-      itemName: rule.document_type,
-      targetCell: '',
-      jumpUrl: '',
-      decisionValue: '',
-      compareValue: '',
-      diff: '',
-      condition: '比較対象なし',
-      message: '正規化後に比較対象科目が見つかりませんでした',
-      detail: '',
-    }));
+  if (headerLikeSkipped > 0) {
+    appendLogRow_(ss, `統合ルール読込: ヘッダー行混入を ${headerLikeSkipped} 行スキップしました`);
+  }
+  if (duplicatedSkipped > 0) {
+    appendLogRow_(ss, `統合ルール読込: 重複ルールを ${duplicatedSkipped} 行スキップしました`);
   }
 
-  return results;
+  return deduped;
+}
+
+function isHeaderLikeUnifiedRule_(rule) {
+  const id = String(rule.rule_id || '').trim();
+  const checkType = String(rule.check_type || '').trim();
+  const srcSheet = String(rule.src_sheet || '').trim();
+  const srcKey = String(rule.src_key || '').trim();
+  const srcAgg = String(rule.src_agg || '').trim();
+  const dstSheet = String(rule.dst_sheet || '').trim();
+  const dstKey = String(rule.dst_key || '').trim();
+  const dstAgg = String(rule.dst_agg || '').trim();
+
+  return (
+    id === 'ルールID' ||
+    checkType === 'チェック種別' ||
+    srcSheet.includes('照合元シート名') ||
+    srcKey.includes('照合元項目') ||
+    srcAgg.includes('照合元集計方法') ||
+    dstSheet.includes('照合先シート名') ||
+    dstKey.includes('照合先項目') ||
+    dstAgg.includes('照合先集計方法')
+  );
+}
+
+function buildUnifiedRuleDedupKey_(rule) {
+  return [
+    rule.rule_id,
+    rule.enabled ? '1' : '0',
+    rule.check_type,
+    rule.src_sheet,
+    rule.src_key,
+    rule.src_account_col,
+    rule.src_amount_col,
+    rule.src_agg,
+    rule.src_value_expr,
+    rule.dst_sheet,
+    rule.dst_key,
+    rule.dst_account_col,
+    rule.dst_amount_col,
+    rule.dst_agg,
+    rule.dst_value_expr,
+    rule.condition_expr,
+    rule.match_mode,
+    rule.lookup_id,
+    rule.severity,
+    rule.message
+  ].join('|');
+}
+
+function loadLookupMaster_(ss) {
+  const sheet = ss.getSheetByName(CONFIG.SHEET_LOOKUP);
+  if (!sheet) return {};
+
+  const rows = loadRowsAsObjectsJapanese_(sheet);
+  const map = {};
+
+  rows.forEach(r => {
+    const id = String(r['検索定義ID'] || r['検索ID'] || '').trim();
+    if (!id) return;
+
+    map[id] = {
+      enabled: toBooleanJa_(r['有効']),
+      status: String(r['設定状況'] || '').trim(),
+      sheet_pattern: String(r['対象シート名（部分一致）'] || r['対象シート名'] || '').trim(),
+      match_col: String(r['検索列'] || '').trim(),
+      value_col_expr: String(r['取得列・式'] || r['取得列'] || '').trim(),
+      key_type: String(r['検索値の取得方法'] || r['検索値種別'] || '').trim(),
+      key_value: String(r['検索値（固定）'] || r['検索値'] || '').trim(),
+      key_sheet: String(r['検索値取得元シート名'] || r['検索値取得元シート'] || '').trim(),
+      key_cell: String(r['検索値取得セル'] || '').trim(),
+      match_mode: String(r['一致方法'] || r['検索方法'] || '完全一致').trim(),
+      old_rule_id: String(r['旧ルールID'] || '').trim(),
+      note: String(r['備考'] || '').trim(),
+    };
+  });
+
+  return map;
+}
+
+function loadGroupMasterJa_(ss) {
+  const sheet = ss.getSheetByName(CONFIG.SHEET_GROUP_MASTER);
+  if (!sheet) return {};
+
+  const rows = loadRowsAsObjectsJapanese_(sheet);
+  const map = {};
+
+  rows.forEach(r => {
+    const groupName = String(r['グループ名'] || '').trim();
+    const account = String(r['勘定科目'] || r['科目名'] || '').trim();
+    if (!groupName || !account) return;
+
+    if (!map[groupName]) map[groupName] = [];
+    map[groupName].push(account);
+  });
+
+  return map;
+}
+
+function loadNormalizeMasterJa_(ss) {
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NORMALIZE_MASTER);
+  if (!sheet) return [];
+
+  const rows = loadRowsAsObjectsJapanese_(sheet);
+  return rows
+    .map(r => ({
+      from: normalizeText_(r['変換前'] || r['元キーワード'] || ''),
+      to: normalizeText_(r['変換後'] || r['正規化後科目'] || ''),
+    }))
+    .filter(r => r.from && r.to);
+}
+
+function loadExcludeMasterJa_(ss) {
+  const sheet = ss.getSheetByName(CONFIG.SHEET_EXCLUDE_MASTER);
+  if (!sheet) return [];
+
+  const rows = loadRowsAsObjectsJapanese_(sheet);
+  return rows
+    .filter(r => String(r['除外科目'] || '').trim())
+    .map(r => ({
+      rule_id: String(r['対象ルールID'] || '').trim(),
+      account: normalizeText_(r['除外科目']),
+    }));
 }
 
 /* =========================
- * rules_kokyo
+ * 統合ルール実行
  * ========================= */
 
-function runKokyoRules_(ss, ctx) {
+function runUnifiedRules_(ss, ctx) {
   const results = [];
-  const frontSheet = findKokyoFrontSheet_(ss);
-  const backFixedSheet = findKokyoBackFixedSheet_(ss);
-  const backMonthlySheet = findKokyoBackMonthlySheet_(ss) || backFixedSheet;
+  const ruleValueRows = [];
 
-  const frontMap = frontSheet ? parseKeyValueSheet_(frontSheet) : {};
-  const backFixedMap = backFixedSheet ? parseKeyValueSheet_(backFixedSheet) : {};
-  const backValues = backMonthlySheet ? getSheetValues_(backMonthlySheet).values : [];
-
-  const frontSheetName = frontSheet ? frontSheet.getName() : CONFIG.SHEET_KOKYO_FRONT;
-  const backFixedSheetName = backFixedSheet ? backFixedSheet.getName() : CONFIG.SHEET_KOKYO_BACK;
-  const backMonthlySheetName = backMonthlySheet ? backMonthlySheet.getName() : CONFIG.SHEET_KOKYO_BACK;
-
-  for (const rule of ctx.rulesKokyo) {
-    if (!toBoolean_(rule.enabled)) continue;
-    const checkType = normalizeCheckType_(rule.check_type || rule.checktype || rule['check type']);
-    const backSheetByRule = resolveKokyoBackSheetByRule_(ss, rule, backMonthlySheet, backFixedSheet);
-    const backValuesByRule = backSheetByRule ? getSheetValues_(backSheetByRule).values : backValues;
-    const sheetNameByRule = getKokyoSheetNameByRule_(rule, frontSheetName, backFixedSheetName, backMonthlySheetName, backSheetByRule);
+  for (const rule of ctx.rules) {
+    if (!rule.enabled) continue;
 
     try {
-      switch (checkType) {
+      switch (rule.check_type) {
+        case 'VALUE_MATCH': {
+          const src = resolveRuleSideValue_(ss, rule, 'src', ctx);
+          const dst = resolveRuleSideValue_(ss, rule, 'dst', ctx);
+          ruleValueRows.push({
+            rowIndex: rule.__row_index,
+            srcValue: src.value,
+            dstValue: dst.value,
+          });
+
+          const sheetName = src.sheetName || dst.sheetName || '';
+          const itemName = rule.src_key || rule.dst_key || rule.rule_id;
+          const targetCell = src.a1 || dst.a1 || '';
+          const jumpUrl = targetCell && sheetName ? buildRangeUrl_(ss, sheetName, targetCell) : '';
+
+          results.push(compareNumbersResult_(
+            rule,
+            sheetName,
+            itemName,
+            dst.value,
+            src.value,
+            rule.category || '',
+            targetCell,
+            jumpUrl
+          ));
+          break;
+        }
+
         case 'NOT_BLANK': {
-          const value = getKokyoValueByRule_(rule, frontMap, backFixedMap);
+          const src = resolveRuleSideValue_(ss, rule, 'src', ctx);
+          ruleValueRows.push({
+            rowIndex: rule.__row_index,
+            srcValue: src.value,
+            dstValue: '',
+          });
+          const bad = isBlank_(src.value);
+
           results.push(makeResult_({
-            status: isBlank_(value) ? (rule.severity || '要確認') : 'OK',
-            category: '概況書',
+            status: bad ? (rule.severity || '要確認') : 'OK',
+            category: rule.category || '',
             ruleId: rule.rule_id,
-            sheetName: sheetNameByRule,
-            itemName: rule.item_name,
-            targetCell: '',
-            jumpUrl: '',
+            sheetName: src.sheetName || '',
+            itemName: rule.src_key || rule.rule_id,
+            targetCell: src.a1 || '',
+            jumpUrl: src.a1 && src.sheetName ? buildRangeUrl_(ss, src.sheetName, src.a1) : '',
             decisionValue: '',
-            compareValue: value || '',
+            compareValue: src.value || '',
             diff: '',
             condition: 'NOT_BLANK',
-            message: isBlank_(value) ? rule.message : 'OK',
+            message: bad ? (rule.message || '空欄です') : 'OK',
             detail: '',
           }));
           break;
         }
 
         case 'CONDITIONAL_NOT_BLANK': {
-          const condOk = evaluateConditionAgainstDecision_(rule.condition, ctx);
-          const value = getKokyoValueByRule_(rule, frontMap, backFixedMap);
-          const bad = condOk && isBlank_(value);
+          const src = resolveRuleSideValue_(ss, rule, 'src', ctx);
+          ruleValueRows.push({
+            rowIndex: rule.__row_index,
+            srcValue: src.value,
+            dstValue: '',
+          });
+          const cond = evaluateSimpleCondition_(rule.condition_expr, ctx);
+          const bad = cond && isBlank_(src.value);
 
           results.push(makeResult_({
             status: bad ? (rule.severity || '要確認') : 'OK',
-            category: '概況書',
+            category: rule.category || '',
             ruleId: rule.rule_id,
-            sheetName: sheetNameByRule,
-            itemName: rule.item_name,
-            targetCell: '',
-            jumpUrl: '',
+            sheetName: src.sheetName || '',
+            itemName: rule.src_key || rule.rule_id,
+            targetCell: src.a1 || '',
+            jumpUrl: src.a1 && src.sheetName ? buildRangeUrl_(ss, src.sheetName, src.a1) : '',
             decisionValue: '',
-            compareValue: value || '',
+            compareValue: src.value || '',
             diff: '',
-            condition: rule.condition || '',
-            message: bad ? rule.message : 'OK',
+            condition: 'CONDITIONAL_NOT_BLANK',
+            message: bad ? (rule.message || '条件を満たすのに空欄です') : 'OK',
             detail: '',
           }));
           break;
         }
 
-        case 'MATCH_DECISION': {
-          const sourceType = normalizeText_(rule.source_type || rule.document_type);
-          const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
-          if (sourceType.includes('内訳書') && hasLookupConfig) {
-            const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
-            const lookupValue = resolveBreakdownLookupValue_(ss, rule);
-            results.push(compareNumbersResult_(rule, sheetNameByRule, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
+        case 'TEXT_MATCH': {
+          const src = resolveRuleSideValue_(ss, rule, 'src', ctx);
+          const dst = resolveRuleSideValue_(ss, rule, 'dst', ctx);
+          ruleValueRows.push({
+            rowIndex: rule.__row_index,
+            srcValue: src.value,
+            dstValue: dst.value,
+          });
+
+          if (isBlank_(src.value) && isBlank_(dst.value)) {
+            results.push(null);
             break;
           }
 
-          const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
-          let decisionValue = resolveDecisionExprWithPickRule_(
-            rule.source_detail,
-            ctx.decisionValues,
-            rule.value_pick_rule || 'C>B',
-            ctx,
-            rule.account_match_mode || 'exact'
-          );
-
-          if (decisionValue != null) {
-            decisionValue = toKiloYenFloor_(decisionValue);
-          }
-
-          results.push(compareNumbersResult_(rule, sheetNameByRule, rule.item_name, decisionValue, frontValue, '概況書', '', ''));
+          results.push(compareTextsResult_(
+            rule,
+            src.sheetName || dst.sheetName || '',
+            rule.src_key || rule.rule_id,
+            String(dst.value || ''),
+            String(src.value || ''),
+            rule.category || '',
+            src.a1 || '',
+            src.a1 && src.sheetName ? buildRangeUrl_(ss, src.sheetName, src.a1) : ''
+          ));
           break;
         }
 
-        case 'MATCH_DECISION_EXPR': {
-          const sourceType = normalizeText_(rule.source_type || rule.document_type);
-          const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
-          if (sourceType.includes('内訳書') && hasLookupConfig) {
-            const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
-            const lookupValue = resolveBreakdownLookupValue_(ss, rule);
-            results.push(compareNumbersResult_(rule, sheetNameByRule, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
+        case 'HEADER_EXISTS': {
+          const sheet = findSheetFlexible_(ss, rule.src_sheet);
+          const values = sheet ? sheet.getDataRange().getDisplayValues() : [];
+          const found = sheet ? findCellByText_(values, rule.src_key) : null;
+          const a1 = found ? toA1_(found.row + 1, found.col + 1) : '';
+          ruleValueRows.push({
+            rowIndex: rule.__row_index,
+            srcValue: found ? rule.src_key : '',
+            dstValue: '',
+          });
+
+          results.push(makeResult_({
+            status: found ? 'OK' : (rule.severity || '要確認'),
+            category: rule.category || '',
+            ruleId: rule.rule_id,
+            sheetName: sheet ? sheet.getName() : '',
+            itemName: rule.src_key || '',
+            targetCell: a1,
+            jumpUrl: a1 && sheet ? buildRangeUrl_(ss, sheet.getName(), a1) : '',
+            decisionValue: '',
+            compareValue: found ? rule.src_key : '',
+            diff: '',
+            condition: 'HEADER_EXISTS',
+            message: found ? 'OK' : (rule.message || '見出しが見つかりません'),
+            detail: '',
+          }));
+          break;
+        }
+
+        case 'FIXED_MATCH': {
+          const src = resolveRuleSideValue_(ss, rule, 'src', ctx);
+          const expected = rule.dst_value_expr;
+          ruleValueRows.push({
+            rowIndex: rule.__row_index,
+            srcValue: src.value,
+            dstValue: expected,
+          });
+
+          if (isBlank_(src.value) && isBlank_(expected)) {
+            results.push(null);
             break;
           }
 
-          const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
-          let decisionValue = resolveDecisionExprWithPickRule_(
-            rule.source_detail,
-            ctx.decisionValues,
-            rule.value_pick_rule || 'C>B',
-            ctx,
-            rule.account_match_mode || 'exact'
-          );
-
-          if (decisionValue != null) {
-            decisionValue = toKiloYenFloor_(decisionValue);
-          }
-
-          results.push(compareNumbersResult_(rule, sheetNameByRule, rule.item_name, decisionValue, frontValue, '概況書', '', ''));
+          results.push(compareTextsResult_(
+            rule,
+            src.sheetName || '',
+            rule.src_key || rule.rule_id,
+            String(expected || ''),
+            String(src.value || ''),
+            rule.category || '',
+            src.a1 || '',
+            src.a1 && src.sheetName ? buildRangeUrl_(ss, src.sheetName, src.a1) : ''
+          ));
           break;
         }
 
-        case 'MATCH_BREAKDOWN': {
-          const hasLookupConfig = normalizeText_(rule.lookup_sheet_pattern || rule.source_detail) && normalizeText_(rule.lookup_value_col);
-          if (hasLookupConfig) {
-            const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
-            const lookupValue = resolveBreakdownLookupValue_(ss, rule);
-            results.push(compareNumbersResult_(rule, sheetNameByRule, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
-          } else {
-            results.push(makeResult_({
-              status: rule.severity || '要確認',
-              category: '概況書',
-              ruleId: rule.rule_id,
-              sheetName: sheetNameByRule,
-              itemName: rule.item_name,
-              targetCell: '',
-              jumpUrl: '',
-              decisionValue: '',
-              compareValue: '',
-              diff: '',
-              condition: 'MATCH_BREAKDOWN',
-              message: rule.message,
-              detail: rule.source_detail || '',
-            }));
-          }
-          break;
-        }
+        case 'EXISTS': {
+          const src = resolveRuleSideValue_(ss, rule, 'src', ctx);
+          ruleValueRows.push({
+            rowIndex: rule.__row_index,
+            srcValue: src.value,
+            dstValue: '',
+          });
+          const exists = !isBlank_(src.value);
 
-        case 'MATCH_BREAKDOWN_LOOKUP': {
-          const frontValue = resolveKokyoActualNumber_(rule, frontMap, backFixedMap, backValuesByRule);
-          const lookupValue = resolveBreakdownLookupValue_(ss, rule);
-          results.push(compareNumbersResult_(rule, sheetNameByRule, rule.item_name, lookupValue, frontValue, '概況書', '', ''));
-          break;
-        }
-
-        case 'MATCH_RULE_VALUE': {
-          const actual = String(getKokyoValueByRule_(rule, frontMap, backFixedMap) || '').trim();
-          const expected = String(rule.source_detail || '').trim();
-          results.push(compareTextsResult_(rule, sheetNameByRule, rule.item_name, expected, actual, '概況書', '', ''));
-          break;
-        }
-
-        case 'CALC_MATCH': {
-          const exprText = normalizeText_(rule.source_detail);
-          const isCellExpr = /[A-Z]+\d+/.test(exprText);
-          if (!isCellExpr) {
-            const actual = String(getKokyoValueByRule_(rule, frontMap, backFixedMap) || '').trim();
-            const expected = String(rule.source_detail || '').trim();
-            results.push(compareTextsResult_(rule, sheetNameByRule, rule.item_name, expected, actual, '概況書', '', ''));
-            break;
-          }
-
-          if (!backMonthlySheet) {
-            results.push(makeResult_({
-              status: '要確認',
-              category: '概況書',
-              ruleId: rule.rule_id,
-              sheetName: '',
-              itemName: rule.item_name,
-              targetCell: '',
-              jumpUrl: '',
-              decisionValue: '',
-              compareValue: '',
-              diff: '',
-              condition: '概況書裏面未検出',
-              message: '概況書裏面シートが見つかりません',
-              detail: '',
-            }));
-            break;
-          }
-
-          const calcValue = evaluateCellExpression_(rule.source_detail, backValuesByRule);
-          let targetValue = null;
-
-          if (rule.rule_id === 'K100') {
-            targetValue = toNumber_(getFrontMapValue_(frontMap, '売上_収入_高_千円'));
-          } else if (rule.rule_id === 'K101') {
-            targetValue = toNumber_(getFrontMapValue_(frontMap, '売上_収入_原価_千円'));
-          } else if (rule.rule_id === 'K102') {
-            targetValue =
-              (toNumber_(getFrontMapValue_(frontMap, '販管費のうち_役員報酬_千円')) || 0) +
-              (toNumber_(getFrontMapValue_(frontMap, '販管費のうち_従業員給料_千円')) || 0);
-          }
-
-          results.push(compareNumbersResult_(rule, backMonthlySheetName, rule.item_name, targetValue, calcValue, '概況書', '', ''));
+          results.push(makeResult_({
+            status: exists ? 'OK' : (rule.severity || '要確認'),
+            category: rule.category || '',
+            ruleId: rule.rule_id,
+            sheetName: src.sheetName || '',
+            itemName: rule.src_key || rule.rule_id,
+            targetCell: src.a1 || '',
+            jumpUrl: src.a1 && src.sheetName ? buildRangeUrl_(ss, src.sheetName, src.a1) : '',
+            decisionValue: '',
+            compareValue: src.value || '',
+            diff: '',
+            condition: 'EXISTS',
+            message: exists ? 'OK' : (rule.message || '対象が存在しません'),
+            detail: '',
+          }));
           break;
         }
 
         default:
-          const debugMsg = checkType
-            ? `未対応のcheck_typeです: ${checkType}`
-            : `check_type が空です: row=${rule.__row_index || '?'} header_row=${rule.__header_row || '?'} rule_id=${rule.rule_id || ''} item=${rule.item_name || ''} raw=${rule.__raw_first || ''}（rules_kokyoの列ずれ・1セルTSV貼付の可能性）`;
+          ruleValueRows.push({
+            rowIndex: rule.__row_index,
+            srcValue: '',
+            dstValue: '',
+          });
           results.push(makeResult_({
             status: '要確認',
-            category: '概況書',
+            category: rule.category || '',
             ruleId: rule.rule_id,
             sheetName: '',
-            itemName: rule.item_name,
+            itemName: '',
             targetCell: '',
             jumpUrl: '',
             decisionValue: '',
             compareValue: '',
             diff: '',
-            condition: checkType || '',
-            message: debugMsg,
+            condition: '未対応チェック種別',
+            message: `未対応のチェック種別です: ${rule.check_type}`,
             detail: '',
           }));
       }
-    } catch (err) {
+    } catch (e) {
       results.push(makeResult_({
         status: '要確認',
-        category: '概況書',
+        category: rule.category || '',
         ruleId: rule.rule_id,
-        sheetName: '',
-        itemName: rule.item_name,
+        sheetName: rule.src_sheet || '',
+        itemName: rule.src_key || rule.rule_id,
         targetCell: '',
         jumpUrl: '',
         decisionValue: '',
         compareValue: '',
         diff: '',
         condition: '実行エラー',
-        message: `概況書ルール実行中にエラー: ${err.message}`,
-        detail: err.stack || '',
+        message: e.message,
+        detail: e.stack || '',
       }));
+      ruleValueRows.push({
+        rowIndex: rule.__row_index,
+        srcValue: '',
+        dstValue: '',
+      });
     }
   }
 
+  writeRuleSideValuesToSheet_(ss, ruleValueRows);
   return results;
 }
 
-function resolveBreakdownLookupValue_(ss, rule) {
-  const ruleId = rule.rule_id || '';
-  let representativeName = '';
-  const nameSourcePattern = normalizeText_(rule.lookup_name_source);
-  if (nameSourcePattern) {
-    const nameSourceSheet = findTargetSheetByPattern_(ss, rule.lookup_name_source);
-    if (!nameSourceSheet) {
-      appendLogRow_(ss, `[LOOKUP][${ruleId}] lookup_name_source の対象シートが見つかりません: ${rule.lookup_name_source}`);
-      return null;
+function writeRuleSideValuesToSheet_(ss, rows) {
+  if (!rows || rows.length === 0) return;
+
+  const sheet = ss.getSheetByName(CONFIG.SHEET_RULES);
+  if (!sheet) return;
+
+  const header = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getDisplayValues()[0];
+  const srcCol = header.indexOf('照合元の値') + 1;
+  const dstCol = header.indexOf('照合先の値') + 1;
+  if (srcCol <= 0 && dstCol <= 0) return;
+
+  rows.forEach(row => {
+    if (!row || !row.rowIndex || row.rowIndex < 2) return;
+    if (srcCol > 0) sheet.getRange(row.rowIndex, srcCol).setValue(row.srcValue == null ? '' : row.srcValue);
+    if (dstCol > 0) sheet.getRange(row.rowIndex, dstCol).setValue(row.dstValue == null ? '' : row.dstValue);
+  });
+}
+
+/* =========================
+ * 照合元/照合先 値取得
+ * ========================= */
+
+function resolveRuleSideValue_(ss, rule, side, ctx) {
+  const sheetName = side === 'src' ? rule.src_sheet : rule.dst_sheet;
+  const key = side === 'src' ? rule.src_key : rule.dst_key;
+  const accountCol = side === 'src' ? rule.src_account_col : rule.dst_account_col;
+  const amountCol = side === 'src' ? rule.src_amount_col : rule.dst_amount_col;
+  let agg = String(side === 'src' ? rule.src_agg : rule.dst_agg).trim();
+  const valueExpr = String(side === 'src' ? rule.src_value_expr : rule.dst_value_expr).trim();
+  const matchMode = String(rule.match_mode || '').trim();
+
+  if (agg === '項目値') agg = 'FIRST';
+  if (agg === '項目値あり') agg = 'FIRST_PRESENCE';
+  if (agg === '見出し下合計') agg = 'SUM_BELOW_HEADER';
+  if (agg === '科目別合計') agg = 'SUM_BY_ACCOUNT';
+  if (agg === '科目正規化後の科目別合計') agg = 'SUM_BY_ACCOUNT_NORMALIZED';
+  if (agg === '見出し列合計') agg = 'SUM_HEADER_COLUMN';
+  if (agg === '決算書式') agg = 'DECISION_EXPR';
+  if (agg === '検索定義') agg = 'LOOKUP';
+  if (agg === 'セル計算式') agg = 'CELL_EXPR';
+
+  if (agg === 'DECISION_EXPR') {
+    let decisionValue = resolveDecisionExprSimple_(ctx, valueExpr || key, matchMode);
+
+    const isKilo = shouldApplyKiloScale_(rule, side, key);
+    if (decisionValue != null && isKilo) {
+      decisionValue = Math.floor(decisionValue / 1000);
     }
 
-    const nameCell = String(rule.lookup_name_cell || '').trim();
-    if (nameCell) {
-      representativeName = normalizeText_(nameSourceSheet.getRange(nameCell).getDisplayValue());
-      appendLogRow_(ss, `[LOOKUP][${ruleId}] 代表者名取得: sheet=${nameSourceSheet.getName()} cell=${nameCell} value=${representativeName || '(blank)'}`);
-    } else {
-      appendLogRow_(ss, `[LOOKUP][${ruleId}] lookup_name_cell が未設定のため代表者名を取得できません`);
+    return {
+      value: decisionValue,
+      sheetName: CONFIG.SHEET_DECISION,
+      a1: '',
+    };
+  }
+
+  if (agg === 'LOOKUP') {
+    let lookupId = '';
+
+    if (/^LOOKUP:/i.test(valueExpr)) {
+      lookupId = valueExpr.replace(/^LOOKUP:/i, '').trim();
+    } else if (rule.lookup_id) {
+      lookupId = String(rule.lookup_id).trim();
+    }
+
+    let lookupValue = lookupId ? resolveLookupById_(ss, lookupId, ctx) : null;
+    const lookupDef = lookupId ? ctx.lookupMaster[lookupId] : null;
+
+    const isKilo = shouldApplyKiloScale_(rule, side, key);
+    const alreadyKiloScaledByLookup = isLookupValueAlreadyKiloScaled_(lookupDef);
+
+    if (lookupValue != null && isKilo && !alreadyKiloScaledByLookup) {
+      const n = toNumber_(lookupValue);
+      if (n != null) {
+        lookupValue = Math.floor(n / 1000);
+      }
+    }
+
+    return {
+      value: lookupValue,
+      sheetName: '',
+      a1: '',
+    };
+  }
+
+  if (agg === 'CELL_EXPR') {
+    const sheet = findSheetFlexible_(ss, sheetName);
+    if (!sheet) {
+      return { value: null, sheetName: '', a1: '' };
+    }
+    const values = sheet.getDataRange().getDisplayValues();
+    return {
+      value: evaluateCellExpression_(valueExpr, values),
+      sheetName: sheet.getName(),
+      a1: extractFirstA1FromExpr_(valueExpr),
+    };
+  }
+
+  if (/^LOOKUP:/i.test(valueExpr)) {
+    const lookupId = valueExpr.replace(/^LOOKUP:/i, '').trim();
+    return {
+      value: resolveLookupById_(ss, lookupId, ctx),
+      sheetName: '',
+      a1: '',
+    };
+  }
+
+  if (valueExpr && /[+\-]/.test(valueExpr) && !sheetName) {
+    return {
+      value: resolveDecisionExprSimple_(ctx, valueExpr, matchMode),
+      sheetName: CONFIG.SHEET_DECISION,
+      a1: '',
+    };
+  }
+
+  if (valueExpr && !sheetName) {
+    const directValue = resolveDecisionExprSimple_(ctx, valueExpr, matchMode);
+    if (directValue != null) {
+      return {
+        value: directValue,
+        sheetName: CONFIG.SHEET_DECISION,
+        a1: '',
+      };
     }
   }
 
-  const targetSheet = findTargetSheetByPattern_(ss, rule.lookup_sheet_pattern || rule.source_detail);
-  if (!targetSheet) {
-    appendLogRow_(ss, `[LOOKUP][${ruleId}] lookup_sheet_pattern の対象シートが見つかりません: ${rule.lookup_sheet_pattern || rule.source_detail}`);
+  if (valueExpr && isNumericLike_(valueExpr)) {
+    return {
+      value: toNumber_(valueExpr),
+      sheetName: '',
+      a1: '',
+    };
+  }
+
+  if (!sheetName) {
+    return { value: valueExpr || '', sheetName: '', a1: '' };
+  }
+
+  const sheet = findSheetFlexible_(ss, sheetName);
+  if (!sheet) {
+    return { value: null, sheetName: '', a1: '' };
+  }
+
+  const values = sheet.getDataRange().getDisplayValues();
+
+  if (agg === 'FIRST' && key && /[+\-]/.test(key)) {
+    const exprValue = resolveSheetFirstExpressionValue_(values, key, amountCol);
+    return {
+      value: exprValue.value,
+      sheetName: sheet.getName(),
+      a1: exprValue.a1,
+    };
+  }
+
+  const found = key ? findCellByText_(values, key) : null;
+
+  if (agg === 'FIRST_PRESENCE') {
+    if (!found) return { value: null, sheetName: sheet.getName(), a1: '' };
+    const val = findRightTextValue_(values, found.row, found.col);
+    return {
+      value: val,
+      sheetName: sheet.getName(),
+      a1: toA1_(found.row + 1, found.col + 1),
+    };
+  }
+
+  if (agg === 'FIRST') {
+    if (!found) return { value: null, sheetName: sheet.getName(), a1: '' };
+
+    const colIndex = amountCol ? colToIndex_(amountCol) : found.col;
+    if (colIndex < 0) {
+      return {
+        value: values[found.row][found.col],
+        sheetName: sheet.getName(),
+        a1: toA1_(found.row + 1, found.col + 1),
+      };
+    }
+
+    return {
+      value: values[found.row][colIndex],
+      sheetName: sheet.getName(),
+      a1: toA1_(found.row + 1, colIndex + 1),
+    };
+  }
+
+  if (agg === 'SUM_BELOW_HEADER') {
+    if (!found || !amountCol) {
+      return { value: null, sheetName: sheet.getName(), a1: '' };
+    }
+    const colIndex = colToIndex_(amountCol);
+    return {
+      value: sumColumnBelowHeader_(values, found.row, colIndex, ''),
+      sheetName: sheet.getName(),
+      a1: toA1_(found.row + 1, colIndex + 1),
+    };
+  }
+
+  if (agg === 'SUM_HEADER_COLUMN') {
+    if (!found) {
+      return { value: null, sheetName: sheet.getName(), a1: '' };
+    }
+    const sumCol = found.col;
+    return {
+      value: sumColumnBelowHeader_(values, found.row, sumCol, ''),
+      sheetName: sheet.getName(),
+      a1: toA1_(found.row + 1, sumCol + 1),
+    };
+  }
+
+  if (agg === 'SUM_BY_ACCOUNT' || agg === 'SUM_BY_ACCOUNT_NORMALIZED') {
+    if (!found || !accountCol || !amountCol) {
+      return { value: null, sheetName: sheet.getName(), a1: '' };
+    }
+
+    const accountIndex = colToIndex_(accountCol);
+    const amountIndex = colToIndex_(amountCol);
+    const excludeSet = buildExcludeSetForRule_(rule.rule_id, ctx.excludeMaster);
+
+    const sums = {};
+    let firstRow = -1;
+
+    for (let r = found.row + 1; r < values.length; r++) {
+      const rawAccount = normalizeText_(values[r][accountIndex]);
+      if (!rawAccount) continue;
+
+      let account = rawAccount;
+      if (agg === 'SUM_BY_ACCOUNT_NORMALIZED') {
+        account = normalizeAccountByRule_(rawAccount, ctx.normalizeRules) || rawAccount;
+      }
+
+      if (excludeSet.has(account)) continue;
+
+      const n = toNumber_(values[r][amountIndex]);
+      if (n == null) continue;
+
+      if (firstRow < 0) firstRow = r;
+      sums[account] = (sums[account] || 0) + n;
+    }
+
+    const expr = valueExpr || key;
+    const resultValue = resolveAccountExpressionFromMap_(expr, sums);
+
+    markAccountsUsedFromExpr_(ctx, expr);
+
+    return {
+      value: resultValue,
+      sheetName: sheet.getName(),
+      a1: firstRow >= 0 ? toA1_(firstRow + 1, amountIndex + 1) : '',
+    };
+  }
+
+  if (valueExpr !== '') {
+    return { value: valueExpr, sheetName: '', a1: '' };
+  }
+
+  return { value: null, sheetName: sheet.getName(), a1: '' };
+}
+
+function resolveSheetFirstExpressionValue_(values, expr, amountCol) {
+  const tokens = String(expr || '').match(/[+\-]?[^+\-]+/g);
+  if (!tokens) return { value: null, a1: '' };
+
+  const forcedCol = amountCol ? colToIndex_(amountCol) : -1;
+  let total = 0;
+  let foundAny = false;
+  let firstA1 = '';
+
+  for (const token of tokens) {
+    const raw = String(token || '').trim();
+    if (!raw) continue;
+
+    const sign = raw.startsWith('-') ? -1 : 1;
+    const label = raw.replace(/^[+\-]/, '').trim();
+    if (!label) continue;
+
+    const found = findCellByText_(values, label);
+    if (!found) continue;
+
+    const colIndex = forcedCol >= 0 ? forcedCol : found.col;
+    if (colIndex < 0) continue;
+
+    const n = toNumber_(values[found.row][colIndex]);
+    if (n == null) continue;
+
+    total += sign * n;
+    foundAny = true;
+    if (!firstA1) firstA1 = toA1_(found.row + 1, colIndex + 1);
+  }
+
+  return {
+    value: foundAny ? total : null,
+    a1: firstA1,
+  };
+}
+
+function shouldApplyKiloScale_(rule, side, sideKeyRaw) {
+  const sideKey = normalizeText_(sideKeyRaw || '');
+  const pairKey = normalizeText_(side === 'src' ? rule.dst_key : rule.src_key);
+  return hasKiloLabel_(sideKey) || hasKiloLabel_(pairKey);
+}
+
+function hasKiloLabel_(text) {
+  const s = normalizeText_(text || '');
+  return s.includes('_千円') || s.includes('千円');
+}
+
+function isLookupValueAlreadyKiloScaled_(lookupDef) {
+  if (!lookupDef) return false;
+  const expr = String(lookupDef.value_col_expr || '').toUpperCase();
+  if (!expr) return false;
+
+  return (
+    /\/\s*1000(?:\D|$)/.test(expr) ||
+    /ROUNDDOWN\s*\(.+\/\s*1000\s*,\s*0\s*\)/.test(expr) ||
+    /ROUND\s*\(.+\/\s*1000\s*,\s*0\s*\)/.test(expr)
+  );
+}
+
+/* =========================
+ * LOOKUP
+ * ========================= */
+
+function resolveLookupById_(ss, lookupId, ctx) {
+  const def = ctx.lookupMaster[lookupId];
+  if (!def || !def.enabled) return null;
+
+  const sheet = findSheetFlexible_(ss, def.sheet_pattern);
+  if (!sheet) return null;
+
+  const values = sheet.getDataRange().getDisplayValues();
+  const matchCol = colToIndex_(def.match_col);
+  if (matchCol < 0) return null;
+
+  let searchValue = '';
+  let useAutoRepresentative = false;
+
+  if (def.key_type === '他シートセル') {
+    const srcSheet = findSheetFlexible_(ss, def.key_sheet);
+    if (!srcSheet) return null;
+    if (!def.key_cell) return null;
+    searchValue = srcSheet.getRange(def.key_cell).getDisplayValue();
+  } else if (def.key_type === '固定値') {
+    searchValue = def.key_value;
+  } else if (def.key_type === '要設定' || def.key_type === '') {
+    useAutoRepresentative = true;
+  } else {
+    searchValue = def.key_value;
+  }
+
+  // 通常検索
+  if (!useAutoRepresentative) {
+    if (isBlank_(searchValue)) return null;
+
+    for (let r = 0; r < values.length; r++) {
+      const cell = String(values[r][matchCol] || '').trim();
+      if (!cell) continue;
+
+      if (isTextMatchJa_(cell, searchValue, def.match_mode)) {
+        return getMultiColValue_(values[r], def.value_col_expr);
+      }
+    }
     return null;
   }
 
-  const values = targetSheet.getDataRange().getDisplayValues();
-  const rawMatchCol = String(rule.lookup_match_col || '').trim();
-  let matchCol = colToIndex_(rawMatchCol);
-  if (matchCol < 0) {
-    matchCol = a1ColToIndex_(rule.lookup_name_cell);
-    if (matchCol >= 0) {
-      const reason = rawMatchCol
-        ? `lookup_match_col が不正`
-        : 'lookup_match_col 未設定';
-      appendLogRow_(ss, `[LOOKUP][${ruleId}] ${reason}のため lookup_name_cell の列を代用: ${rule.lookup_name_cell}`);
+  // 要設定時の自動代表者行検出
+  const repRow = findRepresentativeRowForLookup_(values);
+  if (repRow < 0) return null;
+
+  return getMultiColValue_(values[repRow], def.value_col_expr);
+}
+
+function findRepresentativeRowForLookup_(values) {
+  if (!values || values.length === 0) return -1;
+
+  // ヘッダー行っぽいところを飛ばして 5行目以降を優先
+  const startRow = Math.min(4, values.length - 1);
+
+  let foundByHonin = -1;
+  let foundByGaito = -1;
+  let foundByDaihyo = -1;
+
+  for (let r = startRow; r < values.length; r++) {
+    const row = values[r] || [];
+    const joined = row.map(v => normalizeText_(v)).join('|');
+    if (!joined) continue;
+
+    // 明細行らしさがない行は飛ばす
+    const hasAnyText = row.some(v => String(v || '').trim() !== '');
+    if (!hasAnyText) continue;
+
+    if (joined.includes('本人') && foundByHonin < 0) {
+      foundByHonin = r;
+    }
+    if (joined.includes('該当') && foundByGaito < 0) {
+      foundByGaito = r;
+    }
+    if (joined.includes('代表') && foundByDaihyo < 0) {
+      foundByDaihyo = r;
     }
   }
-  const matchMode = rule.account_match_mode || 'contains';
 
-  if (matchCol < 0) {
-    appendLogRow_(ss, `[LOOKUP][${ruleId}] lookup_match_col が不正です: ${rule.lookup_match_col || '(blank)'}`);
-    return null;
-  }
+  if (foundByHonin >= 0) return foundByHonin;
+  if (foundByGaito >= 0) return foundByGaito;
+  if (foundByDaihyo >= 0) return foundByDaihyo;
 
-  appendLogRow_(ss, `[LOOKUP][${ruleId}] 照合開始: targetSheet=${targetSheet.getName()} matchCol=${indexToCol_(matchCol)} valueCol=${rule.lookup_value_col || '(blank)'} mode=${matchMode} representative=${representativeName || '(blank)'}`);
-
-  for (let r = 0; r < values.length; r++) {
-    if (!representativeName && !isLikelyBreakdownDataRow_(values[r], r)) continue;
-
-    const cellText = values[r][matchCol];
-    if (!cellText) continue;
-
-    if (!representativeName || isMatchByMode_(cellText, representativeName, matchMode)) {
-      const value = getMultiColValue_(values[r], rule.lookup_value_col);
-      appendLogRow_(ss, `[LOOKUP][${ruleId}] 一致行: row=${r + 1} matchValue=${normalizeText_(cellText)} lookupValue=${value}`);
-      return value;
-    }
-  }
-
-  appendLogRow_(ss, `[LOOKUP][${ruleId}] 一致行なし: representative=${representativeName || '(blank)'} matchCol=${indexToCol_(matchCol)}`);
-  return null;
+  return -1;
 }
 
-function isLikelyBreakdownDataRow_(row, rowIndex) {
-  if (!row) return false;
-  const firstCol = normalizeText_(row[0]);
-  if (firstCol.includes('通常明細行') || firstCol.includes('明細行')) return true;
-  if (firstCol.includes('明細区分')) return false;
-  return rowIndex >= 4;
-}
+function isTextMatchJa_(cell, target, mode) {
+  const a = normalizeText_(cell);
+  const b = normalizeText_(target);
+  const m = String(mode || '完全一致').trim();
 
-function a1ColToIndex_(a1) {
-  const m = String(a1 || '').trim().match(/^([A-Z]+)\d+$/i);
-  if (!m) return -1;
-  return colToIndex_(m[1]);
-}
-
-function isMatchByMode_(cellText, targetText, mode) {
-  const cell = normalizeText_(cellText);
-  const target = normalizeText_(targetText);
-  const m = String(mode || 'exact').toLowerCase();
-
-  if (!cell || !target) return false;
-
-  if (m === 'exact') return cell === target;
-  if (m === 'prefix') return cell.startsWith(target);
-  if (m === 'suffix') return cell.endsWith(target);
-  if (m === 'contains') return cell.includes(target);
-
-  return cell === target;
+  if (!a || !b) return false;
+  if (m === '完全一致') return a === b;
+  if (m === '部分一致') return a.includes(b);
+  if (m === '前方一致') return a.startsWith(b);
+  if (m === '後方一致') return a.endsWith(b);
+  return a === b;
 }
 
 function getMultiColValue_(row, colExpr) {
-  if (!colExpr) return 0;
+  if (!colExpr) return null;
   let expr = String(colExpr).trim();
-  if (!expr) return 0;
+  if (!expr) return null;
 
   let roundDownDigits = null;
   const roundDownMatch = expr.match(/^ROUNDDOWN\((.+),\s*(-?\d+)\)$/i);
@@ -1361,11 +1405,12 @@ function getMultiColValue_(row, colExpr) {
   }
 
   const value = evaluateRowMathExpr_(row, expr);
-  if (value == null) return 0;
+  if (value == null) return null;
 
   if (roundDownDigits == null) return value;
-  const factor = Math.pow(10, roundDownDigits);
-  return Math.floor(value * factor) / factor;
+
+  const factor = Math.pow(10, -roundDownDigits);
+  return Math.floor(value / factor) * factor;
 }
 
 function evaluateRowMathExpr_(row, expr) {
@@ -1380,15 +1425,18 @@ function evaluateRowMathExpr_(row, expr) {
   if (!/^[0-9+\-*/().\s]+$/.test(replaced)) return null;
 
   try {
-    // ルールシートの式専用（四則演算のみ）
     return Number(Function(`"use strict"; return (${replaced});`)());
   } catch (e) {
     return null;
   }
 }
 
-function resolveDecisionExprWithPickRule_(expr, values, valuePickRule, ctx, matchMode) {
-  const text = normalizeText_(expr);
+/* =========================
+ * 決算書式
+ * ========================= */
+
+function resolveDecisionExprSimple_(ctx, expr, matchMode) {
+  const text = String(expr || '').trim();
   if (!text) return null;
 
   const tokens = text.match(/[+-]?[^+-]+/g);
@@ -1399,49 +1447,28 @@ function resolveDecisionExprWithPickRule_(expr, values, valuePickRule, ctx, matc
 
   for (const token of tokens) {
     const sign = token.startsWith('-') ? -1 : 1;
-    const raw = token.replace(/^[+-]/, '');
-    const part = normalizeText_(raw);
+    const name = token.replace(/^[+-]/, '').trim();
+    if (!name) continue;
 
     let value = null;
 
-    if (ctx.groups[part]) {
+    if (ctx.groups[name]) {
       value = 0;
       let foundGroup = false;
 
-      for (const acc of ctx.groups[part]) {
-        const matchedRows = findDecisionRowsByAccount_(values, acc, 'exact');
-        for (const row of matchedRows) {
-          const v = pickValueByRule_(row, valuePickRule);
-          if (v != null) {
-            value += v;
-            foundGroup = true;
-            markDecisionAccountUsed_(ctx, acc);
-          }
+      ctx.groups[name].forEach(acc => {
+        const n = findDecisionValueByMode_(ctx.decisionMap, acc, matchMode);
+        if (n != null) {
+          value += n;
+          foundGroup = true;
+          markDecisionAccountUsed_(ctx, acc);
         }
-      }
+      });
 
       if (!foundGroup) value = null;
     } else {
-      const matchedRows = findDecisionRowsByAccount_(values, part, matchMode || 'exact');
-
-      if (matchedRows.length > 0) {
-        value = 0;
-        let foundRowValue = false;
-
-        for (const row of matchedRows) {
-          const v = pickValueByRule_(row, valuePickRule);
-          if (v != null) {
-            value += v;
-            foundRowValue = true;
-          }
-        }
-
-        if (!foundRowValue) {
-          value = null;
-        } else {
-          markDecisionAccountUsed_(ctx, part);
-        }
-      }
+      value = findDecisionValueByMode_(ctx.decisionMap, name, matchMode);
+      if (value != null) markDecisionAccountUsed_(ctx, name);
     }
 
     if (value != null) {
@@ -1453,89 +1480,157 @@ function resolveDecisionExprWithPickRule_(expr, values, valuePickRule, ctx, matc
   return foundAny ? total : null;
 }
 
-function findDecisionRowsByAccount_(values, accountName, matchMode) {
-  const target = normalizeText_(accountName);
-  const rows = [];
-  const mode = String(matchMode || 'exact').toLowerCase();
+function findDecisionValueByMode_(decisionMap, name, matchMode) {
+  const target = normalizeText_(name);
+  const mode = normalizeMatchMode_(matchMode);
 
-  for (let r = 0; r < values.length; r++) {
-    const cell = normalizeText_(values[r][0]);
-    if (!cell) continue;
-
-    let hit = false;
-
-    if (mode === 'exact') {
-      hit = (cell === target);
-    } else if (mode === 'prefix') {
-      hit = cell.startsWith(target);
-    } else if (mode === 'suffix') {
-      hit = cell.endsWith(target);
-    } else if (mode === 'contains') {
-      hit = cell.includes(target);
-    } else {
-      hit = (cell === target);
-    }
-
-    if (hit) rows.push(values[r]);
+  if (mode === 'exact') {
+    return decisionMap[target] != null ? decisionMap[target] : null;
   }
 
-  return rows;
+  let sum = 0;
+  let found = false;
+
+  Object.keys(decisionMap).forEach(k => {
+    let hit = false;
+    if (mode === 'contains') hit = k.includes(target);
+    else if (mode === 'prefix') hit = k.startsWith(target);
+    else if (mode === 'suffix') hit = k.endsWith(target);
+    else hit = (k === target);
+
+    if (hit && decisionMap[k] != null) {
+      sum += decisionMap[k];
+      found = true;
+    }
+  });
+
+  return found ? sum : null;
 }
 
-function pickValueByRule_(row, ruleText) {
-  const rule = String(ruleText || 'C>B').trim().toUpperCase();
+function resolveAccountExpressionFromMap_(expr, valueMap) {
+  const text = String(expr || '').trim();
+  if (!text) return null;
 
-  const colMap = {
-    A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14
-  };
+  const tokens = text.match(/[+-]?[^+-]+/g);
+  if (!tokens) return null;
 
-  if (rule === 'B_ONLY') return toNumber_(row[colMap.B]);
-  if (rule === 'C_ONLY') return toNumber_(row[colMap.C]);
+  let total = 0;
+  let foundAny = false;
 
-  if (rule === 'RIGHTMOST') {
-    for (let i = row.length - 1; i >= 0; i--) {
-      const n = toNumber_(row[i]);
-      if (n != null) return n;
+  for (const token of tokens) {
+    const sign = token.startsWith('-') ? -1 : 1;
+    const name = normalizeText_(token.replace(/^[+-]/, ''));
+    if (!name) continue;
+
+    if (valueMap[name] != null) {
+      total += sign * valueMap[name];
+      foundAny = true;
     }
-    return null;
   }
 
-  const order = rule.split('>').map(s => s.trim()).filter(Boolean);
-  for (const col of order) {
-    if (colMap[col] == null) continue;
-    const n = toNumber_(row[colMap[col]]);
-    if (n != null) return n;
-  }
+  return foundAny ? total : null;
+}
 
-  for (let i = row.length - 1; i >= 0; i--) {
-    const n = toNumber_(row[i]);
-    if (n != null) return n;
-  }
+function markAccountsUsedFromExpr_(ctx, expr) {
+  const text = String(expr || '').trim();
+  if (!text) return;
+  const tokens = text.match(/[+-]?[^+-]+/g);
+  if (!tokens) return;
 
-  return null;
+  tokens.forEach(token => {
+    const name = normalizeText_(token.replace(/^[+-]/, ''));
+    if (!name) return;
+    if (ctx.groups[name]) {
+      ctx.groups[name].forEach(acc => markDecisionAccountUsed_(ctx, acc));
+    } else {
+      markDecisionAccountUsed_(ctx, name);
+    }
+  });
 }
 
 /* =========================
- * 入力値全般チェック + Gemini
+ * 決算書解析
+ * ========================= */
+
+function parseDecisionSheet_(sheet) {
+  const values = sheet.getDataRange().getDisplayValues();
+  const map = {};
+  const bsAccounts = [];
+  let inBsRange = false;
+  let bsRangeFinished = false;
+
+  for (let r = 0; r < values.length; r++) {
+    const account = normalizeText_(values[r][0]);
+    if (!account) continue;
+
+    let amount = null;
+    for (let c = values[r].length - 1; c >= 1; c--) {
+      const n = toNumber_(values[r][c]);
+      if (n != null) {
+        amount = n;
+        break;
+      }
+    }
+
+    if (amount != null) {
+      map[account] = amount;
+
+      if (!bsRangeFinished) {
+        inBsRange = true;
+      }
+
+      if (inBsRange && !isSummaryAccountForBsUnused_(account)) {
+        bsAccounts.push(account);
+      }
+
+      if (account === normalizeText_('固定負債合計')) {
+        bsRangeFinished = true;
+        inBsRange = false;
+      }
+    }
+  }
+
+  return { map, bsAccounts };
+}
+
+function isSummaryAccountForBsUnused_(accountName) {
+  const s = normalizeText_(accountName);
+  if (!s) return false;
+  return /合計$/.test(s);
+}
+
+/* =========================
+ * AIチェック（ラフ版）
  * ========================= */
 
 function runGlobalInputAnomalyChecks_(ss) {
   const results = [];
+  const apiKey = getGeminiApiKey_();
+  if (!apiKey) return results;
+
   const ignoreSheets = new Set([
-    CONFIG.SHEET_RULES_MAIN,
-    CONFIG.SHEET_RULES_KOKYO,
+    CONFIG.SHEET_RULES,
+    CONFIG.SHEET_LOOKUP,
     CONFIG.SHEET_GROUP_MASTER,
     CONFIG.SHEET_NORMALIZE_MASTER,
     CONFIG.SHEET_EXCLUDE_MASTER,
     CONFIG.SHEET_AI_TARGETS,
     CONFIG.SHEET_RESULT,
     CONFIG.SHEET_LOG,
-    CONFIG.SHEET_REPORT
+    CONFIG.SHEET_REPORT,
+    CONFIG.SHEET_ACCOUNT_MATCH_LOG,
+    CONFIG.SHEET_AI_CHECK_LOG
   ]);
 
-  const aiCache = {};
   const aiTargets = loadAiCheckTargets_(ss);
   const hasTargetConfig = Object.keys(aiTargets).length > 0;
+  const aiCache = {};
+  const aiStats = {
+    checked: 0,
+    apiErrors: 0,
+    errorSamples: []
+  };
+  const aiAuditRows = [];
 
   ss.getSheets().forEach(sheet => {
     const sheetName = sheet.getName();
@@ -1552,33 +1647,47 @@ function runGlobalInputAnomalyChecks_(ss) {
     const ranges = hasTargetConfig
       ? targets.filter(t => t.enabled)
       : [{ startCol: 2, endCol: 21 }];
-    if (hasTargetConfig && ranges.length === 0) return;
+
+    if (!ranges.length) return;
+
     const visited = new Set();
 
     for (const range of ranges) {
       for (let r = CONFIG.AI_CHECK_START_ROW - 1; r < values.length; r++) {
         for (let c = range.startCol - 1; c <= range.endCol - 1; c++) {
-          const cellKey = `${r}:${c}`;
-          if (visited.has(cellKey)) continue;
-          visited.add(cellKey);
+          const key = `${r}:${c}`;
+          if (visited.has(key)) continue;
+          visited.add(key);
 
-          const raw = values[r][c];
-          const text = String(raw || '').trim();
+          const text = String(values[r][c] || '').trim();
           if (!text) continue;
           if (/^[0-9,\.\-△()\/年月日円千百]+$/.test(text)) continue;
           if (text.length <= 1) continue;
+          if (isAccountingTerm_(text)) continue;
+          aiStats.checked++;
 
           let ai = aiCache[text];
+          const fromCache = !!ai;
           if (!ai) {
-            ai = callGeminiBreakdownCheckSafe_(text, sheetName);
+            ai = callGeminiBreakdownCheckSafe_(text, sheetName, aiStats);
             aiCache[text] = ai;
             Utilities.sleep(120);
           }
 
+          const a1 = toA1_(r + 1, c + 1);
+          aiAuditRows.push([
+            new Date(),
+            sheetName,
+            a1,
+            text,
+            fromCache ? 'CACHE' : 'API',
+            ai && ai.is_suspicious ? '不自然' : '問題なし',
+            ai && ai.reason ? ai.reason : ''
+          ]);
+
           if (!ai || !ai.is_suspicious) continue;
           if (!shouldKeepAiFinding_(text, ai)) continue;
 
-          const a1 = toA1_(r + 1, c + 1);
           const jumpUrl = buildRangeUrl_(ss, sheetName, a1);
 
           results.push(makeResult_({
@@ -1605,55 +1714,85 @@ function runGlobalInputAnomalyChecks_(ss) {
     }
   });
 
+  appendLogRow_(
+    ss,
+    `AI入力値チェック: チェック件数=${aiStats.checked}, 指摘件数=${results.length}, APIエラー=${aiStats.apiErrors}`
+  );
+  if (aiStats.errorSamples.length) {
+    aiStats.errorSamples.forEach((msg, i) => {
+      appendLogRow_(ss, `AI APIエラー詳細(${i + 1}): ${msg}`);
+    });
+  }
+  writeAiCheckLog_(ss, aiAuditRows);
+
   return results;
 }
 
-function resolveAiTargetsForSheet_(aiTargets, sheetName) {
-  const out = [];
-  const seenKeys = new Set();
-  const normSheet = normalizeText_(sheetName);
+function writeAiCheckLog_(ss, rows) {
+  const sheet = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_AI_CHECK_LOG);
+  sheet.clearContents().clearFormats();
+  sheet.getRange(1, 1, 1, 7).setValues([[
+    '日時',
+    'シート名',
+    'セル',
+    '入力値',
+    '取得元',
+    'AI判定',
+    'AI理由'
+  ]]);
 
-  if (aiTargets[sheetName]) {
-    out.push(...aiTargets[sheetName]);
-    seenKeys.add(sheetName);
-  }
+  if (!rows || rows.length === 0) return;
+  sheet.getRange(2, 1, rows.length, 7).setValues(rows);
+}
 
-  Object.keys(aiTargets).forEach(k => {
-    if (seenKeys.has(k)) return;
-    const normKey = normalizeText_(k);
-    if (!normKey) return;
-    if (normSheet.includes(normKey)) {
-      out.push(...aiTargets[k]);
-    }
-  });
-
-  return out;
+function isAccountingTerm_(text) {
+  const t = normalizeText_(text);
+  const keywords = [
+    '預り金','仮受金','仮払金','前払費用','前払金','前渡金',
+    '未払金','未払費用','売掛金','買掛金','貸付金','借入金',
+    '減価償却費','仕入高','役員給与','役員報酬','役員賞与',
+    '役員退職金','地代家賃','保険積立金','預託金','立替金',
+    '雑給','給与','雑収入','雑損失','敷金','保証金',
+    '源泉所得税','住民税','普通預金','当座預金','定期預金',
+    '普通','当座','定期','社宅','事務所','家賃','常勤','非常勤',
+    '本人','該当','その他','登録番号'
+  ];
+  return keywords.some(k => t === normalizeText_(k));
 }
 
 function loadAiCheckTargets_(ss) {
   const sheet = ss.getSheetByName(CONFIG.SHEET_AI_TARGETS);
   if (!sheet) return {};
 
-  const rows = loadRowsAsObjects_(sheet);
+  const rows = loadRowsAsObjectsJapanese_(sheet);
   const map = {};
 
   rows.forEach(r => {
-    const sheetName = String(r.sheet_name || r.sheetname || r['sheet name'] || '').trim();
+    const sheetName = String(r['対象シート名'] || '').trim();
     if (!sheetName) return;
-
-    const enabled = String(r.enabled == null ? 'TRUE' : r.enabled).trim().toUpperCase();
-    const startCol = parseColRefTo1Based_(r.start_col || r.startcol || r['start col']) || 2;
-    const endCol = parseColRefTo1Based_(r.end_col || r.endcol || r['end col']) || 21;
 
     if (!map[sheetName]) map[sheetName] = [];
     map[sheetName].push({
-      enabled: enabled !== 'FALSE' && enabled !== '0' && enabled !== 'NO',
-      startCol: Math.max(1, Math.min(startCol, endCol)),
-      endCol: Math.max(startCol, endCol)
+      enabled: toBooleanJa_(r['有効']),
+      startCol: parseColRefTo1Based_(r['開始列']) || 2,
+      endCol: parseColRefTo1Based_(r['終了列']) || 21,
     });
   });
 
   return map;
+}
+
+function resolveAiTargetsForSheet_(aiTargets, sheetName) {
+  const out = [];
+  const normSheet = normalizeText_(sheetName);
+
+  Object.keys(aiTargets).forEach(k => {
+    if (normalizeText_(k) && normSheet.includes(normalizeText_(k))) {
+      out.push(...aiTargets[k]);
+    }
+  });
+
+  return out;
 }
 
 function parseColRefTo1Based_(v) {
@@ -1670,68 +1809,30 @@ function shouldKeepAiFinding_(text, ai) {
   const norm = normalizeText_(t);
 
   if (!t) return false;
-
-  // 今回は「明らかな誤入力」を中心に拾うため、業務上許容される語は除外
-  if (/^(登録番号|売掛金|買掛金|仮払金|仮受金|本人|該当|該当なし)$/u.test(norm)) return false;
-  if (/^T\d{13}$/i.test(norm)) return false; // インボイス登録番号
+  if (isAccountingTerm_(t)) return false;
+  if (norm.length <= 2) return false;
+  if (/^T\d{13}$/i.test(norm)) return false;
   if (/^(令和|平成|昭和)\d+年\d+月\d+日$/u.test(norm)) return false;
-  if (/^\d+[-‐－~～]\d+月/.test(norm)) return false; // 例: 1-2月利用分
+  if (/^[0-9０-９\-－ー\/／.．]+$/.test(norm)) return false;
 
-  const hasClearTypoSignal =
-    /(誤字|脱字|文字化け|重複|欠落|誤入力|入力ミス|途切れ|存在しません)/u.test(reason) ||
-    /(.)\1/u.test(norm); // 例: 北沢沢
+  const blockedReasonSignals = [
+    /情報不足/u,
+    /正式名称不足/u,
+    /法人格/u,
+    /不完全/u,
+    /内容が足りない/u,
+    /説明不足/u
+  ];
 
-  // 全角英字だけの一般語（例: Ｌａｂｏｒａｔｏｒｙ）も残す
-  const fullWidthAlphaOnly = /^[Ａ-Ｚａ-ｚ]+$/u.test(norm);
+  const textLooksSuspicious =
+    /�/.test(t) ||
+    /[Ａ-Ｚａ-ｚ]{4,}/.test(t) ||
+    /(.)\1{2,}/.test(norm);
 
-  return hasClearTypoSignal || fullWidthAlphaOnly;
-}
-
-function callGemini_(text) {
-  const apiKey = getGeminiApiKey_();
-  const model = getGeminiModel_();
-
-  if (!apiKey) {
-    return "Geminiキー未設定";
-  }
-
-  const url =
-    "https://generativelanguage.googleapis.com/v1beta/models/" +
-    model +
-    ":generateContent?key=" +
-    apiKey;
-
-  const payload = {
-    contents: [
-      {
-        parts: [
-          {
-            text:
-              "以下の日本語の誤字・不自然表現・文字化けをチェックし、修正案を簡潔に提示してください。\n\n" +
-              text
-          }
-        ]
-      }
-    ],
-    generationConfig: {
-      temperature: 0.2
-    }
-  };
-
-  const res = UrlFetchApp.fetch(url, {
-    method: "post",
-    contentType: "application/json",
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
-
-  const json = JSON.parse(res.getContentText());
-
-  if (json.error) {
-    return "Geminiエラー: " + json.error.message;
-  }
-
-  return json.candidates?.[0]?.content?.parts?.[0]?.text || "応答なし";
+  if (textLooksSuspicious) return true;
+  if (!reason) return false;
+  if (blockedReasonSignals.some(re => re.test(reason))) return false;
+  return reason.length >= 4;
 }
 
 function getGeminiApiKey_() {
@@ -1747,8 +1848,8 @@ function callGeminiBreakdownCheck_(text, sheetName) {
   const apiKey = getGeminiApiKey_();
   if (!apiKey) {
     return {
-      is_suspicious: true,
-      reason: 'GEMINI_API_KEY が未設定です',
+      is_suspicious: false,
+      reason: '',
       suggestions: []
     };
   }
@@ -1758,24 +1859,31 @@ function callGeminiBreakdownCheck_(text, sheetName) {
 
   const prompt = `
 あなたは税務申告書の内訳書チェック支援AIです。
-対象は「○○の内訳」シートの入力値です。
-次の文字列が、税務書類の入力値として不自然かどうか判定してください。
+対象は「○○の内訳」シートなどの入力値です。
 
-特に次の観点を重視してください。
-- 誤字脱字
+次の文字列について、
+「誤字・脱字・文字化け・存在しない地名の可能性・存在しないブランド名の可能性・明らかな不自然表記」
+だけを中心に判定してください。
+
+次の理由では原則として指摘しないでください。
+- 情報不足
+- 正式名称不足
+- 法人格（株式会社など）がない
+- 銀行名だけ、支店名だけ、住所だけ等の不完全さ
+- 勘定科目として妥当かどうか
+- 内訳として内容が足りないという理由だけ
+- 一般的な略称や通称
+- 単なる説明不足
+
+特に残したいもの：
+- 明らかな誤字脱字
+- 会社名や氏名が途中で切れている
 - 文字化け
-- 同じ語の重複（例: 所沢沢）
-- 半角カナと全角カナの混在
-- 全角英数字と半角英数字の不自然混在
-- 日本語と英字の不自然な連結（例: F菱UFJ銀行）
-- 銀行名・会社名・地名・氏名として不自然
-- 明らかな入力ミスの可能性
+- 不自然な空白や重複
+- 実在しない地名の可能性
+- 実在しないブランド名・社名の可能性
 
-注意:
-- 珍しい固有名詞の可能性もあるため、断定しすぎず要確認ベースで判断してください。
-- 明らかに自然で問題ない場合は is_suspicious を false にしてください。
-- 修正候補は最大2件まで。
-- JSONだけ返してください。
+JSONだけ返してください。
 
 シート名: ${sheetName}
 入力文字列: ${text}
@@ -1783,17 +1891,13 @@ function callGeminiBreakdownCheck_(text, sheetName) {
 返却形式:
 {
   "is_suspicious": true,
-  "reason": "不自然だと考える理由",
+  "reason": "理由",
   "suggestions": ["候補1", "候補2"]
 }
 `.trim();
 
   const payload = {
-    contents: [
-      {
-        parts: [{ text: prompt }]
-      }
-    ],
+    contents: [{ parts: [{ text: prompt }] }],
     generationConfig: {
       temperature: 0.1,
       responseMimeType: 'application/json'
@@ -1818,7 +1922,7 @@ function callGeminiBreakdownCheck_(text, sheetName) {
   const textOut = json.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!textOut) throw new Error('Gemini応答が空です');
 
-  const parsed = JSON.parse(textOut);
+  const parsed = parseGeminiJsonResponse_(textOut);
 
   return {
     is_suspicious: !!parsed.is_suspicious,
@@ -1827,21 +1931,148 @@ function callGeminiBreakdownCheck_(text, sheetName) {
   };
 }
 
-function callGeminiBreakdownCheckSafe_(text, sheetName) {
+function parseGeminiJsonResponse_(textOut) {
+  const s = String(textOut || '').trim();
+  if (!s) throw new Error('Gemini応答JSONが空です');
+
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    const fenced = s.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fenced && fenced[1]) {
+      return JSON.parse(fenced[1]);
+    }
+    const firstObj = s.match(/\{[\s\S]*\}/);
+    if (firstObj && firstObj[0]) {
+      return JSON.parse(firstObj[0]);
+    }
+    throw e;
+  }
+}
+
+function callGeminiBreakdownCheckSafe_(text, sheetName, aiStats) {
   try {
     return callGeminiBreakdownCheck_(text, sheetName);
   } catch (e) {
+    if (aiStats) {
+      aiStats.apiErrors = (aiStats.apiErrors || 0) + 1;
+      if ((aiStats.errorSamples || []).length < 3) {
+        aiStats.errorSamples.push(String(e && e.message ? e.message : e));
+      }
+    }
     return {
-      is_suspicious: true,
-      reason: `Gemini判定エラー: ${e && e.message ? e.message : String(e)}`,
+      is_suspicious: false,
+      reason: '',
       suggestions: []
     };
   }
 }
 
 /* =========================
- * report_A4
+ * 未照合BS科目
  * ========================= */
+
+function buildUnusedBSAccountResults_(ctx) {
+  const results = [];
+  const excludedAccounts = new Set([
+    normalizeText_('普通預金'),
+    normalizeText_('未払消費税等'),
+    normalizeText_('未払法人税等')
+  ]);
+
+  ctx.bsAccounts.forEach(account => {
+    const a = normalizeText_(account);
+    if (!a) return;
+    if (excludedAccounts.has(a)) return;
+
+    const isUnused = !ctx.usedDecisionAccounts.has(a);
+    const decisionValue = toNumber_(ctx.decisionMap[a]);
+    const hasAmount = decisionValue != null && decisionValue >= 1;
+
+    if (isUnused && hasAmount) {
+      results.push(makeResult_({
+        status: '要確認',
+        category: '未照合BS科目',
+        ruleId: 'BS001',
+        sheetName: CONFIG.SHEET_DECISION,
+        itemName: a,
+        targetCell: '',
+        jumpUrl: '',
+        decisionValue: decisionValue,
+        compareValue: '',
+        diff: '',
+        condition: 'UNUSED_BS_ACCOUNT',
+        message: '決算書のBS科目ですが、今回どの照合にも使用されていません',
+        detail: '',
+      }));
+    }
+  });
+
+  return results;
+}
+
+/* =========================
+ * 結果出力
+ * ========================= */
+
+function writeResults_(ss, results) {
+  const sheet = getRequiredSheet_(ss, CONFIG.SHEET_RESULT);
+  const filtered = (results || []).filter(r => r != null);
+  if (!filtered.length) return;
+
+  const rows = filtered.map(r => ([
+    r.status || '',
+    r.category || '',
+    r.ruleId || '',
+    r.sheetName || '',
+    r.itemName || '',
+    r.targetCell || '',
+    r.jumpUrl || '',
+    r.decisionValue === undefined ? '' : r.decisionValue,
+    r.compareValue === undefined ? '' : r.compareValue,
+    r.diff === undefined ? '' : r.diff,
+    r.condition || '',
+    r.message || '',
+    r.detail || '',
+    r.aiJudge || '',
+    r.aiReason || '',
+    r.aiSuggestion1 || '',
+    r.aiSuggestion2 || '',
+    Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
+  ]));
+
+  sheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function writeAccountMatchLog_(ss, ctx) {
+  const sheet = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_ACCOUNT_MATCH_LOG);
+  sheet.clearContents().clearFormats();
+  sheet.getRange(1, 1, 1, 6).setValues([[
+    'No',
+    '勘定科目',
+    '決算書値',
+    '照合利用有無',
+    '対象レンジ内',
+    '備考'
+  ]]);
+
+  const rows = (ctx.bsAccounts || []).map((account, idx) => {
+    const key = normalizeText_(account);
+    const used = key ? ctx.usedDecisionAccounts.has(key) : false;
+    return [
+      idx + 1,
+      key || '',
+      key ? (ctx.decisionMap[key] != null ? ctx.decisionMap[key] : '') : '',
+      used ? '照合済み' : '未照合',
+      '対象',
+      used ? '' : '今回のルールで未使用'
+    ];
+  });
+
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, 6).setValues(rows);
+  }
+}
 
 function buildA4Report_(ss) {
   const src = getRequiredSheet_(ss, CONFIG.SHEET_RESULT);
@@ -1861,9 +2092,16 @@ function buildA4Report_(ss) {
   const picked = rows.filter(r => {
     const status = String(r[colIndex['判定']] || '');
     if (status === 'OK') return false;
-    const decisionValue = toNumber_(r[colIndex['決算書値']]);
-    const compareValue = toNumber_(r[colIndex['比較値']]);
+
+    const decisionRaw = r[colIndex['決算書値']];
+    const compareRaw = r[colIndex['比較値']];
+
+    if (isBlank_(decisionRaw) && isBlank_(compareRaw)) return false;
+
+    const decisionValue = toNumber_(decisionRaw);
+    const compareValue = toNumber_(compareRaw);
     const bothZero = decisionValue === 0 && compareValue === 0;
+
     return !bothZero;
   });
 
@@ -1925,568 +2163,388 @@ function buildA4Report_(ss) {
 }
 
 /* =========================
- * 決算書解析
+ * 比較結果
  * ========================= */
+function compareNumbersResult_(rule, sheetName, itemName, expected, actual, category, targetCell, jumpUrl) {
+  const n1 = toNumber_(expected);
+  const n2 = toNumber_(actual);
 
-function parseDecisionSheet_(sheet) {
-  const { values } = getSheetValues_(sheet);
-  const map = {};
-  const bsAccounts = [];
-  const bsTargetRanges = findBsAccountTargetRanges_(values);
+  const isBlank1 = isBlank_(expected);
+  const isBlank2 = isBlank_(actual);
 
-  let section = '';
-  let inBS = false;
+  const isZero1 = n1 === 0;
+  const isZero2 = n2 === 0;
 
-  for (let r = 0; r < values.length; r++) {
-    const colA = normalizeText_(values[r][0]);
-    const colB = values[r][1];
-    const colC = values[r][2];
-    const colD = values[r][3];
-
-    const key = colA;
-    const amount = pickDecisionAmount_(colB, colC, colD);
-
-    if (!key) continue;
-
-    if (key.includes('資産の部')) {
-      section = '資産の部';
-      inBS = true;
-    } else if (key.includes('負債の部')) {
-      section = '負債の部';
-      inBS = true;
-    } else if (key.includes('純資産の部')) {
-      section = '純資産の部';
-      inBS = false;
-    }
-
-    if (amount != null) {
-      map[key] = amount;
-    }
-
-    if (section && amount != null && key && !key.includes('の部')) {
-      map[`${section}:${key}`] = amount;
-    }
-
-    if (isInBsAccountTargetRanges_(r, bsTargetRanges) && amount != null && isRealBSAccount_(key)) {
-      bsAccounts.push(key);
-    }
+  if (
+    (isBlank1 && isBlank2) ||
+    (isZero1 && isBlank2) ||
+    (isBlank1 && isZero2) ||
+    (isZero1 && isZero2)
+  ) {
+    return null;
   }
 
-  return {
-    map,
-    bsAccounts: [...new Set(bsAccounts)],
-  };
-}
-
-function findBsAccountTargetRanges_(values) {
-  const indexOfContains = (text) => {
-    const needle = normalizeText_(text);
-    for (let r = 0; r < values.length; r++) {
-      const a = normalizeText_(values[r][0]);
-      if (!a) continue;
-      if (a.includes(needle)) return r;
-    }
-    return -1;
-  };
-
-  const otherCurrentAssetsTotal = indexOfContains('その他流動資産合計');
-  const tangibleFixedAssetsTotal = indexOfContains('有形固定資産合計');
-  const investmentAndOtherAssetsTotal = indexOfContains('投資その他の資産合計');
-  const assetsTotal = indexOfContains('資産の部合計');
-  const fixedLiabilitiesTotal = indexOfContains('固定負債合計');
-
-  return {
-    topStart: 0,
-    topEnd: otherCurrentAssetsTotal >= 0 ? otherCurrentAssetsTotal : -1, // end-exclusive
-    middleAssetsStart: tangibleFixedAssetsTotal >= 0 ? tangibleFixedAssetsTotal + 1 : -1,
-    middleAssetsEnd: investmentAndOtherAssetsTotal >= 0 ? investmentAndOtherAssetsTotal : -1, // end-exclusive
-    liabilitiesStart: assetsTotal >= 0 ? assetsTotal + 1 : -1,
-    liabilitiesEnd: fixedLiabilitiesTotal >= 0 ? fixedLiabilitiesTotal : -1, // end-exclusive
-  };
-}
-
-function isInBsAccountTargetRanges_(rowIndex0, ranges) {
-  if (!ranges) return false;
-  const inTop = ranges.topEnd > ranges.topStart && rowIndex0 >= ranges.topStart && rowIndex0 < ranges.topEnd;
-  const inMiddleAssets = ranges.middleAssetsStart >= 0 && ranges.middleAssetsEnd > ranges.middleAssetsStart &&
-    rowIndex0 >= ranges.middleAssetsStart && rowIndex0 < ranges.middleAssetsEnd;
-  const inLiabilities = ranges.liabilitiesStart >= 0 && ranges.liabilitiesEnd > ranges.liabilitiesStart &&
-    rowIndex0 >= ranges.liabilitiesStart && rowIndex0 < ranges.liabilitiesEnd;
-  return inTop || inMiddleAssets || inLiabilities;
-}
-
-function pickDecisionAmount_(colB, colC, colD) {
-  const c = toNumber_(colC);
-  if (c != null) return c;
-  const b = toNumber_(colB);
-  if (b != null) return b;
-  return toNumber_(colD);
-}
-
-function isRealBSAccount_(key) {
-  const k = normalizeText_(key);
-  if (!k) return false;
-
-  const excludes = new Set([
-    '資産の部合計',
-    '負債の部合計',
-    '純資産の部合計',
-    '流動資産',
-    '固定資産',
-    '繰延資産',
-    '流動負債',
-    '固定負債',
-    '株主資本',
-    '資本金',
-    '利益剰余金',
-    'その他利益剰余金',
-    '繰越利益剰余金',
-    '評価・換算差額等',
-    '新株予約権'
-  ]);
-
-  if (excludes.has(k)) return false;
-  if (k.startsWith('【') && k.endsWith('】')) return false;
-  if (k.includes('合計')) return false;
-  if (k.includes('うち')) return false;
-
-  return true;
-}
-
-function loadRulesMain_(ss) {
-  return loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_RULES_MAIN));
-}
-
-function loadRulesKokyo_(ss) {
-  const sheet = getRequiredSheet_(ss, CONFIG.SHEET_RULES_KOKYO);
-  const { displayValues } = getSheetValues_(sheet);
-  if (displayValues.length < 2) return [];
-
-  const headerRow = detectHeaderRow_(displayValues);
-  const headerKeys = new Set(displayValues[headerRow].map(v => normalizeText_(v).toLowerCase()));
-  const hasHeader =
-    (headerKeys.has('rule_id') || headerKeys.has('ruleid')) &&
-    (headerKeys.has('check_type') || headerKeys.has('checktype'));
-  if (hasHeader) return loadRowsAsObjects_(sheet);
-
-  return parseRulesKokyoByPosition_(displayValues);
-}
-
-function parseRulesKokyoByPosition_(displayValues) {
-  const out = [];
-  for (let r = 0; r < displayValues.length; r++) {
-    let row = displayValues[r];
-    if (!row || row.join('').trim() === '') continue;
-
-    // 1セルにTSV形式で入っているケースを救済
-    if (
-      row.length > 0 &&
-      String(row[0] || '').includes('\t') &&
-      row.slice(1).every(v => String(v || '').trim() === '')
-    ) {
-      row = String(row[0]).split('\t');
-    }
-
-    const idMatch = String(row[0] || '').match(/K\d{3}/);
-    if (!idMatch) continue;
-
-    out.push({
-      rule_id: idMatch[0],
-      enabled: row[1],
-      item_name: row[2],
-      check_type: row[3],
-      document_type: row[4],
-      source_detail: row[5],
-      value_pick_rule: row[6],
-      account_match_mode: row[7],
-      lookup_sheet_pattern: row[8],
-      lookup_name_source: row[9],
-      lookup_name_cell: row[10],
-      lookup_match_col: row[11],
-      lookup_value_col: row[12],
-      condition: row[13],
-      severity: row[14],
-      message: row[15],
-      __row_index: r + 1,
-      __raw_first: String(row[0] || '')
+  if (n1 == null || n2 == null) {
+    return makeResult_({
+      status: rule.severity || '要確認',
+      category: category || '',
+      ruleId: rule.rule_id,
+      sheetName: sheetName || '',
+      itemName: itemName || '',
+      targetCell: targetCell || '',
+      jumpUrl: jumpUrl || '',
+      decisionValue: expected == null ? '' : expected,
+      compareValue: actual == null ? '' : actual,
+      diff: '',
+      condition: rule.check_type || 'VALUE_MATCH',
+      message: rule.message || '比較値または参照値を取得できませんでした',
+      detail: '',
     });
   }
-  return out;
-}
 
-function loadGroupMaster_(ss) {
-  const rows = loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_GROUP_MASTER));
-  const map = {};
-  rows.forEach(r => {
-    const g = normalizeText_(r.group_name);
-    const a = normalizeText_(r.account_name);
-    if (!g || !a) return;
-    if (!map[g]) map[g] = [];
-    map[g].push(a);
+  const diff = n2 - n1;
+  const ok = Math.abs(diff) < 0.000001;
+
+  return makeResult_({
+    status: ok ? 'OK' : (rule.severity || '要確認'),
+    category: category || '',
+    ruleId: rule.rule_id,
+    sheetName: sheetName || '',
+    itemName: itemName || '',
+    targetCell: targetCell || '',
+    jumpUrl: jumpUrl || '',
+    decisionValue: n1,
+    compareValue: n2,
+    diff: diff,
+    condition: rule.check_type || 'VALUE_MATCH',
+    message: ok ? 'OK' : (rule.message || '値が一致しません'),
+    detail: '',
   });
-  return map;
 }
 
-function loadNormalizeMaster_(ss) {
-  return loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_NORMALIZE_MASTER))
-    .map(r => ({
-      keyword: normalizeText_(r.keyword),
-      normalized: normalizeText_(r.normalized),
-    }))
-    .filter(r => r.keyword && r.normalized);
-}
+function compareTextsResult_(rule, sheetName, itemName, expected, actual, category, targetCell, jumpUrl) {
+  const ok = String(expected || '').trim() === String(actual || '').trim();
 
-function loadExcludeMaster_(ss) {
-  const rows = loadRowsAsObjects_(getRequiredSheet_(ss, CONFIG.SHEET_EXCLUDE_MASTER));
-  const set = new Set();
-  rows.forEach(r => {
-    const name = normalizeText_(r.account_name);
-    if (name) set.add(name);
+  return makeResult_({
+    status: ok ? 'OK' : (rule.severity || '要確認'),
+    category: category || '',
+    ruleId: rule.rule_id,
+    sheetName: sheetName || '',
+    itemName: itemName || '',
+    targetCell: targetCell || '',
+    jumpUrl: jumpUrl || '',
+    decisionValue: expected || '',
+    compareValue: actual || '',
+    diff: '',
+    condition: rule.check_type || 'TEXT_MATCH',
+    message: ok ? 'OK' : (rule.message || '文字列が一致しません'),
+    detail: '',
   });
-  return set;
+}
+
+function makeResult_(obj) {
+  return {
+    status: obj.status || '',
+    category: obj.category || '',
+    ruleId: obj.ruleId || '',
+    sheetName: obj.sheetName || '',
+    itemName: obj.itemName || '',
+    targetCell: obj.targetCell || '',
+    jumpUrl: obj.jumpUrl || '',
+    decisionValue: obj.decisionValue,
+    compareValue: obj.compareValue,
+    diff: obj.diff,
+    condition: obj.condition || '',
+    message: obj.message || '',
+    detail: obj.detail || '',
+    aiJudge: obj.aiJudge || '',
+    aiReason: obj.aiReason || '',
+    aiSuggestion1: obj.aiSuggestion1 || '',
+    aiSuggestion2: obj.aiSuggestion2 || '',
+  };
 }
 
 /* =========================
- * 決算書値解決
+ * 汎用ユーティリティ
  * ========================= */
 
-function resolveDecisionTargetValue_(rule, ctx) {
-  if (normalizeText_(rule.target_account)) {
-    markDecisionExpressionUsed_(ctx, rule.target_account);
-    return resolveDecisionExpression_(rule.target_account, ctx);
-  }
-  if (normalizeText_(rule.target_account_group)) {
-    const groupName = normalizeText_(rule.target_account_group);
-    const accounts = ctx.groups[groupName] || [];
-    const filtered = accounts.filter(a => ctx.decisionMap[a] != null);
-    filtered.forEach(a => markDecisionAccountUsed_(ctx, a));
-    if (filtered.length === 0) return null;
-    return filtered.reduce((sum, a) => sum + (ctx.decisionMap[a] || 0), 0);
-  }
-  return null;
-}
+function loadRowsAsObjectsJapanese_(sheet) {
+  const values = sheet.getDataRange().getDisplayValues();
+  if (values.length < 2) return [];
 
-function resolveDecisionExpression_(expr, ctx) {
-  const text = normalizeText_(expr);
-  if (!text) return null;
-
-  const parts = text.split('+').map(s => normalizeText_(s)).filter(Boolean);
-  if (parts.length === 0) return null;
-
-  let foundAny = false;
-  const total = parts.reduce((sum, part) => {
-    if (ctx.groups[part]) {
-      const groupAccounts = ctx.groups[part].filter(acc => ctx.decisionMap[acc] != null);
-      if (groupAccounts.length === 0) return sum;
-      foundAny = true;
-      groupAccounts.forEach(acc => markDecisionAccountUsed_(ctx, acc));
-      return sum + groupAccounts.reduce((s, acc) => s + (ctx.decisionMap[acc] || 0), 0);
-    }
-
-    if (ctx.decisionMap[part] != null) {
-      foundAny = true;
-      markDecisionAccountUsed_(ctx, part);
-      return sum + (ctx.decisionMap[part] || 0);
-    }
-
-    return sum;
-  }, 0);
-
-  return foundAny ? total : null;
-}
-
-function markDecisionAccountUsed_(ctx, accountName) {
-  if (!ctx || !ctx.trackDecisionUsage) return;
-  const a = normalizeText_(accountName);
-  if (!a) return;
-  ctx.usedDecisionAccounts.add(a);
-}
-
-function markDecisionExpressionUsed_(ctx, expr) {
-  const text = normalizeText_(expr);
-  if (!text) return;
-
-  const parts = text.split('+').map(s => normalizeText_(s)).filter(Boolean);
-  parts.forEach(part => {
-    if (ctx.groups[part]) {
-      ctx.groups[part].forEach(acc => markDecisionAccountUsed_(ctx, acc));
-    } else {
-      markDecisionAccountUsed_(ctx, part);
-    }
-  });
-}
-
-function toKiloYenFloor_(value) {
-  if (value === null || value === '' || isNaN(value)) return null;
-  return Math.floor(Number(value) / 1000);
-}
-
-/* =========================
- * 汎用
- * ========================= */
-
-function loadRowsAsObjects_(sheet) {
-  const { displayValues } = getSheetValues_(sheet);
-  if (displayValues.length < 2) return [];
-
-  const headerRow = detectHeaderRow_(displayValues);
-  const headers = displayValues[headerRow].map(h => normalizeText_(h));
+  const headers = values[0].map(v => String(v || '').trim());
   const rows = [];
 
-  for (let r = headerRow + 1; r < displayValues.length; r++) {
-    const row = displayValues[r];
-    if (row.join('').trim() === '') continue;
+  for (let r = 1; r < values.length; r++) {
+    const row = {};
+    let hasValue = false;
 
-    const obj = {};
-    headers.forEach((h, i) => obj[h] = row[i]);
-    obj.__row_index = r + 1;
-    obj.__header_row = headerRow + 1;
-    obj.__raw_first = String(row[0] || '');
-    rows.push(obj);
+    for (let c = 0; c < headers.length; c++) {
+      const key = headers[c];
+      if (!key) continue;
+      row[key] = values[r][c];
+      if (String(values[r][c] || '').trim() !== '') hasValue = true;
+    }
+
+    if (hasValue) rows.push(row);
   }
   return rows;
 }
 
-function detectHeaderRow_(displayValues) {
-  const limit = Math.min(displayValues.length, 20);
-  for (let r = 0; r < limit; r++) {
-    const keys = new Set(displayValues[r].map(v => normalizeText_(v).toLowerCase()));
-    const hasRuleId = keys.has('rule_id') || keys.has('ruleid');
-    const hasCheckType =
-      keys.has('check_type') ||
-      keys.has('checktype');
-    const hasItemName = keys.has('item_name') || keys.has('itemname');
-
-    if (hasRuleId && (hasCheckType || hasItemName)) {
-      return r;
-    }
-  }
-  return 0;
-}
-
-function getSheetValues_(sheet) {
-  const range = sheet.getDataRange();
-  return {
-    values: range.getValues(),
-    displayValues: range.getDisplayValues(),
+function normalizeCheckTypeJa_(v) {
+  const s = String(v || '').trim();
+  const map = {
+    '数値照合': 'VALUE_MATCH',
+    '空欄チェック': 'NOT_BLANK',
+    '条件付空欄チェック': 'CONDITIONAL_NOT_BLANK',
+    '文字列照合': 'TEXT_MATCH',
+    '見出し確認': 'HEADER_EXISTS',
+    '固定値一致': 'FIXED_MATCH',
+    '存在確認': 'EXISTS',
+    '検索一致': 'VALUE_MATCH',
   };
+  return map[s] || s;
 }
 
-function getRequiredSheet_(ss, name) {
-  const sh = ss.getSheetByName(name);
-  if (!sh) throw new Error(`シートがありません: ${name}`);
+function normalizeMatchMode_(v) {
+  const s = String(v || '').trim();
+  if (s === '完全一致') return 'exact';
+  if (s === '部分一致') return 'contains';
+  if (s === '前方一致') return 'prefix';
+  if (s === '後方一致') return 'suffix';
+  return 'exact';
+}
+
+function toBooleanJa_(v) {
+  const s = String(v == null ? '' : v).trim().toUpperCase();
+  return ['TRUE', 'T', '1', 'YES', 'Y', '有効', 'ON'].includes(s);
+}
+
+function normalizeText_(v) {
+  return String(v == null ? '' : v)
+    .replace(/\s+/g, '')
+    .replace(/[　]/g, '')
+    .trim();
+}
+
+function toNumber_(v) {
+  if (v == null || v === '') return null;
+  let s = String(v).trim();
+  if (!s) return null;
+
+  let negative = false;
+  if (/^\(.*\)$/.test(s)) {
+    negative = true;
+    s = s.replace(/^\(|\)$/g, '');
+  }
+
+  s = s
+    .replace(/,/g, '')
+    .replace(/△/g, '-')
+    .replace(/▲/g, '-')
+    .replace(/円|千円|百万円/g, '');
+
+  if (!/^-?\d+(\.\d+)?$/.test(s)) return null;
+  let n = Number(s);
+  if (isNaN(n)) return null;
+  if (negative) n = -Math.abs(n);
+  return n;
+}
+
+function isNumericLike_(v) {
+  return toNumber_(v) != null;
+}
+
+function isBlank_(v) {
+  return v == null || String(v).trim() === '';
+}
+
+function ensureSheetInSpreadsheet_(ss, sheetName) {
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) sh = ss.insertSheet(sheetName);
   return sh;
 }
 
-function ensureSheetInSpreadsheet_(ss, name) {
-  return ss.getSheetByName(name) || ss.insertSheet(name);
+function getRequiredSheet_(ss, sheetName) {
+  const sh = ss.getSheetByName(sheetName);
+  if (!sh) throw new Error(`必要シートが見つかりません: ${sheetName}`);
+  return sh;
 }
 
-function findTargetSheetByPattern_(ss, pattern) {
-  const p = normalizeText_(pattern);
+function appendLogRow_(ss, message) {
+  const sheet = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_LOG);
+  sheet.appendRow([
+    Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
+    message
+  ]);
+}
+
+function findSheetFlexible_(ss, pattern) {
+  const p = String(pattern || '').trim();
   if (!p) return null;
 
   const sheets = ss.getSheets();
+
   for (const sh of sheets) {
-    if (normalizeText_(sh.getName()).includes(p)) return sh;
+    if (sh.getName() === p) return sh;
+  }
+  for (const sh of sheets) {
+    if (sh.getName().includes(p)) return sh;
   }
   return null;
 }
 
-function findSheetByFlexibleName_(ss, baseName) {
-  const exact = ss.getSheetByName(baseName);
-  if (exact) return exact;
-
-  const target = normalizeText_(baseName);
+function findCellByText_(values, targetText) {
+  const target = normalizeText_(targetText);
   if (!target) return null;
 
-  const sheets = ss.getSheets();
-  for (const sh of sheets) {
-    const name = normalizeText_(sh.getName());
-    if (name.endsWith(target)) return sh; // 例: 260411_概況書表面
-  }
-  for (const sh of sheets) {
-    const name = normalizeText_(sh.getName());
-    if (name.includes(target)) return sh;
-  }
-  return null;
-}
-
-function findKokyoFrontSheet_(ss) {
-  return (
-    findTargetSheetByPattern_(ss, '法人事業概況説明書(表面)固定項目') ||
-    findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_FRONT) ||
-    findTargetSheetByPattern_(ss, '法人事業概況説明書(表面)')
-  );
-}
-
-function findKokyoBackMonthlySheet_(ss) {
-  // 裏面は「月別の売上高等の状況」を最優先で使用（D19/E19 等の計算で使うため）
-  return (
-    findTargetSheetByPattern_(ss, '月別の売上高等の状況') ||
-    findTargetSheetByPattern_(ss, '法人事業概況説明書(裏面)月別の売上高等の状況') ||
-    findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_BACK)
-  );
-}
-
-function findKokyoBackFixedSheet_(ss) {
-  return (
-    findTargetSheetByPattern_(ss, '法人事業概況説明書(裏面)固定項目') ||
-    findSheetByFlexibleName_(ss, CONFIG.SHEET_KOKYO_BACK) ||
-    findTargetSheetByPattern_(ss, '法人事業概況説明書(裏面)')
-  );
-}
-
-function getKokyoSourceType_(rule) {
-  return normalizeText_(rule.source_type || rule.document_type || '概況書');
-}
-
-function getKokyoSheetNameByRule_(rule, frontSheetName, backFixedSheetName, backMonthlySheetName, backSheetByRule) {
-  if (!getKokyoSourceType_(rule).includes('裏面')) return frontSheetName;
-  if (backSheetByRule) return backSheetByRule.getName();
-  const cellExpr = normalizeText_(getKokyoLookupExpr_(rule));
-  if (cellExpr && isKokyoMonthlyExpr_(cellExpr) && backMonthlySheetName) return backMonthlySheetName;
-  return backFixedSheetName;
-}
-
-function resolveKokyoBackSheetByRule_(ss, rule, defaultBackMonthlySheet, defaultBackFixedSheet) {
-  if (!getKokyoSourceType_(rule).includes('裏面')) return null;
-  const explicitPattern = normalizeText_(rule.compare_sheet_pattern || rule.lookup_sheet_pattern);
-  if (explicitPattern) {
-    return findTargetSheetByPattern_(ss, explicitPattern) || defaultBackMonthlySheet || defaultBackFixedSheet || null;
-  }
-  const cellExpr = normalizeText_(getKokyoLookupExpr_(rule));
-  if (cellExpr && isKokyoMonthlyExpr_(cellExpr)) {
-    return defaultBackMonthlySheet || defaultBackFixedSheet || null;
-  }
-  return defaultBackFixedSheet || defaultBackMonthlySheet || null;
-}
-
-function getKokyoValueByRule_(rule, frontMap, backMap) {
-  return getKokyoSourceType_(rule).includes('裏面')
-    ? getFrontMapValue_(backMap, rule.item_name)
-    : getFrontMapValue_(frontMap, rule.item_name);
-}
-
-function resolveKokyoActualNumber_(rule, frontMap, backMap, backValues) {
-  const cellExpr = normalizeText_(getKokyoLookupExpr_(rule));
-  if (getKokyoSourceType_(rule).includes('裏面') && cellExpr && isKokyoMonthlyExpr_(cellExpr) && Array.isArray(backValues) && backValues.length) {
-    const monthlyExpr = toMonthlyExprWithTotalRow_(cellExpr, backValues);
-    return toNumber_(evaluateCellExpression_(monthlyExpr, backValues));
-  }
-  return toNumber_(getKokyoValueByRule_(rule, frontMap, backMap));
-}
-
-function getKokyoLookupExpr_(rule) {
-  const primary = normalizeText_(rule.lookup_value_col);
-  if (primary) return primary;
-  const fallback = normalizeText_(rule.lookup_match_col);
-  if (fallback && isKokyoMonthlyExpr_(fallback)) return fallback;
-  return '';
-}
-
-function isKokyoMonthlyExpr_(text) {
-  const t = normalizeText_(text).replace(/\s+/g, '');
-  if (!t) return false;
-  if (/[A-Z]+\d+/.test(t)) return true;
-  return /^[A-Z]+([+\-*/][A-Z]+)*$/.test(t);
-}
-
-function toMonthlyExprWithTotalRow_(expr, values) {
-  const t = normalizeText_(expr).replace(/\s+/g, '');
-  if (!t) return expr;
-  if (/[A-Z]+\d+/.test(t)) return t;
-  const totalRow = findKokyoTotalRow1Based_(values);
-  if (!totalRow) return t;
-  return t.replace(/([A-Z]+)(?!\d)/g, `$1${totalRow}`);
-}
-
-function findKokyoTotalRow1Based_(values) {
   for (let r = 0; r < values.length; r++) {
     for (let c = 0; c < values[r].length; c++) {
-      if (normalizeText_(values[r][c]) === normalizeText_('計')) {
-        return r + 1;
+      if (normalizeText_(values[r][c]) === target) {
+        return { row: r, col: c };
       }
     }
   }
-  return null;
-}
 
-function parseKeyValueSheet_(sheet) {
-  const { displayValues } = getSheetValues_(sheet);
-  const map = {};
-
-  for (let r = 0; r < displayValues.length; r++) {
-    const key = normalizeText_(displayValues[r][0]);
-    const value = displayValues[r][1];
-    if (!key) continue;
-    map[key] = value;
-  }
-  return map;
-}
-
-function getFrontMapValue_(frontMap, key) {
-  return frontMap[normalizeText_(key)] || '';
-}
-
-function evaluateConditionAgainstDecision_(condition, ctx) {
-  const text = normalizeText_(condition);
-  if (!text) return false;
-
-  const m = text.match(/^(.+?)(>=|<=|>|<|=)(.+)$/);
-  if (!m) return false;
-
-  const expr = normalizeText_(m[1]);
-  const op = m[2];
-  const rhs = Number(m[3]);
-  const value = resolveDecisionExpression_(expr, ctx) || 0;
-
-  switch (op) {
-    case '>': return value > rhs;
-    case '<': return value < rhs;
-    case '>=': return value >= rhs;
-    case '<=': return value <= rhs;
-    case '=': return value === rhs;
-    default: return false;
-  }
-}
-
-function evaluateCellExpression_(expr, values) {
-  const text = normalizeText_(expr);
-  if (!text) return null;
-
-  const tokens = text.match(/[+-]?[^+-]+/g);
-  if (!tokens) return null;
-
-  let total = 0;
-  let foundAny = false;
-
-  for (const token of tokens) {
-    const sign = token.startsWith('-') ? -1 : 1;
-    const ref = token.replace(/^[+-]/, '');
-    const v = getCellByA1_(values, ref);
-    if (v != null) {
-      total += sign * v;
-      foundAny = true;
+  for (let r = 0; r < values.length; r++) {
+    for (let c = 0; c < values[r].length; c++) {
+      if (normalizeText_(values[r][c]).includes(target)) {
+        return { row: r, col: c };
+      }
     }
   }
 
-  return foundAny ? total : null;
+  return null;
 }
 
-function getCellByA1_(values, a1) {
-  const m = String(a1).match(/^([A-Z]+)(\d+)$/i);
-  if (!m) return 0;
-  const col = colToIndex_(m[1]);
-  const row = Number(m[2]) - 1;
-  if (row < 0 || row >= values.length) return 0;
-  if (col < 0 || col >= values[row].length) return 0;
-  return toNumber_(values[row][col]) || 0;
+function sumColumnBelowHeader_(values, headerRow, amountCol, rowCond) {
+  let sum = 0;
+
+  for (let r = headerRow + 1; r < values.length; r++) {
+    const row = values[r];
+    if (!row) continue;
+
+    if (rowCond && !isRowMatchCondition_(row, rowCond, values, r)) continue;
+
+    const n = toNumber_(row[amountCol]);
+    if (n == null) continue;
+    sum += n;
+  }
+
+  return sum;
 }
 
-function colToIndex_(col) {
-  const s = String(col || '').trim().toUpperCase();
+function isRowMatchCondition_(row, rowCond, values, rowIndex) {
+  const s = String(rowCond || '').trim();
+  if (!s) return true;
+
+  const m1 = s.match(/^([A-Z]+)列\s*<>\s*空欄$/i);
+  if (m1) {
+    const col = colToIndex_(m1[1]);
+    return normalizeText_(row[col]) !== '';
+  }
+
+  const m2 = s.match(/^([A-Z]+)列\s*=\s*(.+)$/i);
+  if (m2) {
+    const col = colToIndex_(m2[1]);
+    return normalizeText_(row[col]) === normalizeText_(m2[2]);
+  }
+
+  return true;
+}
+
+function findRightTextValue_(values, row, startCol) {
+  for (let c = startCol + 1; c < values[row].length; c++) {
+    const v = String(values[row][c] || '').trim();
+    if (v !== '') return v;
+  }
+  return '';
+}
+
+function evaluateSimpleCondition_(expr, ctx) {
+  const text = String(expr || '').trim();
+  if (!text) return false;
+
+  const m = text.match(/^(.+)\s*>\s*0$/);
+  if (m) {
+    const value = resolveDecisionExprSimple_(ctx, m[1], 'exact');
+    return toNumber_(value) != null && toNumber_(value) > 0;
+  }
+
+  const m2 = text.match(/^(.+)\s*>=\s*0$/);
+  if (m2) {
+    const value = resolveDecisionExprSimple_(ctx, m2[1], 'exact');
+    return toNumber_(value) != null && toNumber_(value) >= 0;
+  }
+
+  return false;
+}
+
+function evaluateCellExpression_(expr, values) {
+  const replaced = String(expr || '')
+    .toUpperCase()
+    .replace(/[A-Z]+\d+/g, ref => {
+      const m = ref.match(/^([A-Z]+)(\d+)$/);
+      if (!m) return '0';
+      const col = colToIndex_(m[1]);
+      const row = Number(m[2]) - 1;
+      if (row < 0 || col < 0) return '0';
+      const v = values[row] && values[row][col] != null ? values[row][col] : '';
+      const n = toNumber_(v);
+      return String(n == null ? 0 : n);
+    });
+
+  if (!/^[0-9+\-*/().\s]+$/.test(replaced)) return null;
+
+  try {
+    return Number(Function(`"use strict"; return (${replaced});`)());
+  } catch (e) {
+    return null;
+  }
+}
+
+function extractFirstA1FromExpr_(expr) {
+  const m = String(expr || '').match(/[A-Z]+\d+/);
+  return m ? m[0] : '';
+}
+
+function buildExcludeSetForRule_(ruleId, excludeMaster) {
+  const set = new Set();
+  (excludeMaster || []).forEach(r => {
+    if (!r.account) return;
+    if (!r.rule_id || r.rule_id === ruleId) {
+      set.add(r.account);
+    }
+  });
+  return set;
+}
+
+function normalizeAccountByRule_(rawLabel, normalizeRules) {
+  const raw = normalizeText_(rawLabel);
+  if (!raw) return raw;
+
+  const rules = (normalizeRules || [])
+    .slice()
+    .sort((a, b) => (b.from || '').length - (a.from || '').length);
+
+  for (let i = 0; i < rules.length; i++) {
+    const from = rules[i].from;
+    const to = rules[i].to;
+    if (!from || !to) continue;
+
+    if (raw === from || raw.includes(from)) {
+      return to;
+    }
+  }
+
+  return raw;
+}
+
+function colToIndex_(colRef) {
+  const s = String(colRef || '').trim().toUpperCase();
   if (!s) return -1;
+  if (!/^[A-Z]+$/.test(s)) return -1;
+
   let n = 0;
   for (let i = 0; i < s.length; i++) {
     n = n * 26 + (s.charCodeAt(i) - 64);
@@ -2494,294 +2552,39 @@ function colToIndex_(col) {
   return n - 1;
 }
 
-function indexToCol_(index) {
-  let n = Number(index);
-  if (!Number.isFinite(n) || n < 0) return '';
-  n = Math.floor(n);
+function toA1_(row, col) {
+  return `${indexToCol_(col - 1)}${row}`;
+}
 
+function indexToCol_(index) {
+  let n = Number(index) + 1;
   let s = '';
-  while (n >= 0) {
-    s = String.fromCharCode((n % 26) + 65) + s;
-    n = Math.floor(n / 26) - 1;
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - m) / 26);
   }
   return s;
 }
 
-function findHeaderRowByText_(rows, text, colIndex) {
-  const target = normalizeText_(text);
-  if (!target || colIndex < 0) return -1;
-
-  for (let r = 0; r < rows.length; r++) {
-    const cell = rows[r][colIndex];
-    if (normalizeText_(cell) === target) return r;
-  }
-  return -1;
-}
-
-function sumColumnBelowHeader_(rows, headerRow, colIndex) {
-  let sum = 0;
-  for (let r = headerRow + 1; r < rows.length; r++) {
-    const n = toNumber_(rows[r][colIndex]);
-    if (n != null) sum += n;
-  }
-  return sum;
-}
-
-function findCellByText_(displayValues, text) {
-  const target = normalizeText_(text);
-  for (let r = 0; r < displayValues.length; r++) {
-    for (let c = 0; c < displayValues[r].length; c++) {
-      if (normalizeText_(displayValues[r][c]) === target) {
-        return { row: r, col: c };
-      }
-    }
-  }
-  return null;
-}
-
-function findRightNumericValue_(displayValues, row, col) {
-  for (let c = col + 1; c < Math.min(displayValues[row].length, col + 8); c++) {
-    const n = toNumber_(displayValues[row][c]);
-    if (n != null) return n;
-  }
-  return null;
-}
-
-function findRightTextValue_(displayValues, row, col) {
-  for (let c = col + 1; c < Math.min(displayValues[row].length, col + 8); c++) {
-    const v = normalizeText_(displayValues[row][c]);
-    if (v) return v;
-  }
-  return '';
-}
-
-function normalizeAccountByRule_(text, normalizeRules) {
-  const t = normalizeText_(text);
-  for (const rule of normalizeRules) {
-    if (t.includes(rule.keyword)) return rule.normalized;
-  }
-  return '';
-}
-
-function mergeExcludeAccounts_(ruleExclude, masterSet) {
-  const set = new Set(masterSet ? [...masterSet] : []);
-  normalizeText_(ruleExclude).split('|').map(s => s.trim()).filter(Boolean).forEach(v => set.add(v));
-  return set;
-}
-
 function buildRangeUrl_(ss, sheetName, a1) {
-  const sh = ss.getSheetByName(sheetName);
-  if (!sh || !a1) return '';
-  return `${ss.getUrl()}#gid=${sh.getSheetId()}&range=${encodeURIComponent(a1)}`;
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet || !a1) return '';
+  return `${ss.getUrl()}#gid=${sheet.getSheetId()}&range=${encodeURIComponent(a1)}`;
 }
 
-function compareNumbersResult_(rule, sheetName, itemName, decisionValue, compareValue, category, targetCell, jumpUrl) {
-  const d = toNumber_(decisionValue);
-  const c = toNumber_(compareValue);
-
-  if (d == null) {
-    return makeResult_({
-      status: 'SKIP',
-      category: category || '内訳書',
-      ruleId: rule.rule_id,
-      sheetName,
-      itemName,
-      targetCell: targetCell || '',
-      jumpUrl: jumpUrl || '',
-      decisionValue: '',
-      compareValue: c ?? '',
-      diff: '',
-      condition: '決算書科目なし',
-      message: '決算書に対象科目が無いためスキップ',
-      detail: '',
-    });
-  }
-
-  const diff = (c == null) ? '' : c - d;
-  const ok = (c != null && Math.round(d) === Math.round(c));
-
-  return makeResult_({
-    status: ok ? 'OK' : (rule.severity || 'NG'),
-    category: category || '内訳書',
-    ruleId: rule.rule_id,
-    sheetName,
-    itemName,
-    targetCell: targetCell || '',
-    jumpUrl: jumpUrl || '',
-    decisionValue: d,
-    compareValue: c,
-    diff,
-    condition: rule.check_type || '',
-    message: ok ? 'OK' : rule.message,
-    detail: '',
-  });
-}
-
-function compareTextsResult_(rule, sheetName, itemName, expectedValue, actualValue, category, targetCell, jumpUrl) {
-  const expected = String(expectedValue || '').trim();
-  const actual = String(actualValue || '').trim();
-
-  if (!expected) {
-    return makeResult_({
-      status: 'SKIP',
-      category: category || '概況書',
-      ruleId: rule.rule_id,
-      sheetName,
-      itemName,
-      targetCell: targetCell || '',
-      jumpUrl: jumpUrl || '',
-      decisionValue: '',
-      compareValue: actual,
-      diff: '',
-      condition: '期待値未設定',
-      message: 'rules_kokyo の source_detail に期待値を設定してください',
-      detail: '',
-    });
-  }
-
-  const ok = normalizeText_(expected) === normalizeText_(actual);
-  return makeResult_({
-    status: ok ? 'OK' : (rule.severity || 'NG'),
-    category: category || '概況書',
-    ruleId: rule.rule_id,
-    sheetName,
-    itemName,
-    targetCell: targetCell || '',
-    jumpUrl: jumpUrl || '',
-    decisionValue: expected,
-    compareValue: actual,
-    diff: '',
-    condition: rule.check_type || '',
-    message: ok ? 'OK' : rule.message,
-    detail: '',
-  });
-}
-
-function ngHeaderNotFound_(rule, sheet) {
-  return makeResult_({
-    status: rule.severity || 'NG',
-    category: '内訳書',
-    ruleId: rule.rule_id,
-    sheetName: sheet.getName(),
-    itemName: rule.header_name,
-    targetCell: '',
-    jumpUrl: '',
-    decisionValue: '',
-    compareValue: '',
-    diff: '',
-    condition: 'ヘッダー未検出',
-    message: `${rule.header_name} が見つかりません`,
-    detail: '',
-  });
-}
-
-function toA1_(row, col) {
-  let s = '';
-  while (col > 0) {
-    const m = (col - 1) % 26;
-    s = String.fromCharCode(65 + m) + s;
-    col = Math.floor((col - 1) / 26);
-  }
-  return `${s}${row}`;
-}
-
-function makeResult_(obj) {
-  return [
-    obj.status || '',
-    obj.category || '',
-    obj.ruleId || '',
-    obj.sheetName || '',
-    obj.itemName || '',
-    obj.targetCell || '',
-    obj.jumpUrl || '',
-    obj.decisionValue ?? '',
-    obj.compareValue ?? '',
-    obj.diff ?? '',
-    obj.condition || '',
-    obj.message || '',
-    obj.detail || '',
-    obj.aiJudge || '',
-    obj.aiReason || '',
-    obj.aiSuggestion1 || '',
-    obj.aiSuggestion2 || '',
-    new Date(),
-  ];
-}
-
-function writeResults_(ss, rows) {
-  const sh = getRequiredSheet_(ss, CONFIG.SHEET_RESULT);
-  if (!rows.length) return;
-  sh.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
-}
-
-function appendLogRow_(ss, message) {
-  const sh = ensureSheetInSpreadsheet_(ss, CONFIG.SHEET_LOG);
-  sh.appendRow([new Date(), message]);
+function markDecisionAccountUsed_(ctx, account) {
+  const key = normalizeText_(account);
+  if (key) ctx.usedDecisionAccounts.add(key);
 }
 
 function getNowStr_() {
-  return Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd_HHmmss');
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Tokyo', 'yyyyMMdd_HHmmss');
 }
 
-function normalizeText_(v) {
-  return String(v || '')
-    .replace(/\s/g, '')
-    .replace(/[　]/g, '')
-    .trim();
-}
-
-function normalizeCheckType_(v) {
-  const t = String(v || '').trim().toUpperCase();
-  if (!t) return '';
-
-  const aliasMap = {
-    'NOTBLANK': 'NOT_BLANK',
-    'CONDITIONALNOTBLANK': 'CONDITIONAL_NOT_BLANK',
-    'MATCHDECISION': 'MATCH_DECISION',
-    'MATCHDECISIONEXPR': 'MATCH_DECISION_EXPR',
-    'MATCHBREAKDOWN': 'MATCH_BREAKDOWN',
-    'MATCHBREAKDOWNLOOKUP': 'MATCH_BREAKDOWN_LOOKUP',
-    'MATCHRULEVALUE': 'MATCH_RULE_VALUE',
-    'CALCMATCH': 'CALC_MATCH',
-    'NOTBLANKWHENROWEXISTS': 'NOT_BLANK_WHEN_ROW_EXISTS',
-  };
-  return aliasMap[t.replace(/[_\-\s]/g, '')] || t;
-}
-
-function isBlank_(v) {
-  return normalizeText_(v) === '';
-}
-
-function toBoolean_(v) {
-  const s = String(v == null ? '' : v).toUpperCase();
-  return s === 'TRUE' || s === '1' || s === 'YES';
-}
-
-function toNumber_(v) {
-  if (v == null || v === '') return null;
-  if (typeof v === 'number') return v;
-
-  let s = String(v).trim();
-  if (!s) return null;
-
-  s = s
-    .replace(/,/g, '')
-    .replace(/△/g, '-')
-    .replace(/[()]/g, '')
-    .replace(/円/g, '');
-
-  if (!s || s === '-') return null;
-
-  const n = Number(s);
-  return isNaN(n) ? null : n;
-}
-
-function isSectionLike_(text) {
-  const t = normalizeText_(text);
-  return (
-    t.startsWith('【') ||
-    t.includes('合計') ||
-    t.includes('計') ||
-    t.includes('の部')
-  );
+function escapeHtml_(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
