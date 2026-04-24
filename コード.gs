@@ -1328,7 +1328,11 @@ function resolveSheetLastExpressionValue_(values, expr, accountCol, amountCol, m
     if (!raw) continue;
 
     const sign = raw.startsWith('-') ? -1 : 1;
-    const label = raw.replace(/^[+\-]/, '').trim();
+    const tokenBody = stripOuterParens_(raw.replace(/^[+\-]/, '').trim());
+    if (!tokenBody) continue;
+
+    const parsed = parseLabelScaleExpr_(tokenBody);
+    const label = parsed.label;
     if (!label) continue;
 
     let foundRow = -1;
@@ -1347,7 +1351,17 @@ function resolveSheetLastExpressionValue_(values, expr, accountCol, amountCol, m
     const n = toNumber_(values[foundRow][amountIndex]);
     if (n == null) continue;
 
-    total += sign * n;
+    let scaled = n;
+    if (parsed.op && parsed.operand != null) {
+      if (parsed.op === '*') {
+        scaled = scaled * parsed.operand;
+      } else if (parsed.op === '/') {
+        if (parsed.operand === 0) continue;
+        scaled = scaled / parsed.operand;
+      }
+    }
+
+    total += sign * scaled;
     foundAny = true;
     if (!firstA1) firstA1 = toA1_(foundRow + 1, amountIndex + 1);
   }
@@ -1360,6 +1374,30 @@ function resolveSheetLastExpressionValue_(values, expr, accountCol, amountCol, m
   return {
     value: finalValue,
     a1: firstA1,
+  };
+}
+
+function stripOuterParens_(text) {
+  let s = String(text || '').trim();
+  if (!s) return '';
+  while (s.startsWith('(') && s.endsWith(')')) {
+    const inner = s.slice(1, -1).trim();
+    if (!inner) return '';
+    s = inner;
+  }
+  return s;
+}
+
+function parseLabelScaleExpr_(tokenBody) {
+  const s = String(tokenBody || '').trim();
+  const m = s.match(/^(.+?)\s*([*/])\s*(-?\d+(?:\.\d+)?)$/);
+  if (!m) {
+    return { label: s, op: '', operand: null };
+  }
+  return {
+    label: String(m[1] || '').trim(),
+    op: String(m[2] || '').trim(),
+    operand: Number(m[3]),
   };
 }
 
