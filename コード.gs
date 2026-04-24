@@ -2450,7 +2450,13 @@ function compareNumbersResult_(rule, sheetName, itemName, expected, actual, cate
 }
 
 function compareTextsResult_(rule, sheetName, itemName, expected, actual, category, targetCell, jumpUrl) {
-  const ok = String(expected || '').trim() === String(actual || '').trim();
+  const expectedText = String(expected || '').trim();
+  const actualText = String(actual || '').trim();
+  const mode = String(rule && rule.match_mode ? rule.match_mode : '完全一致').trim();
+
+  const ok = (!expectedText && !actualText)
+    ? true
+    : isTextMatchJa_(actualText, expectedText, mode);
 
   return makeResult_({
     status: ok ? 'OK' : (rule.severity || '要確認'),
@@ -2460,8 +2466,8 @@ function compareTextsResult_(rule, sheetName, itemName, expected, actual, catego
     itemName: itemName || '',
     targetCell: targetCell || '',
     jumpUrl: jumpUrl || '',
-    decisionValue: expected || '',
-    compareValue: actual || '',
+    decisionValue: expectedText,
+    compareValue: actualText,
     diff: '',
     condition: rule.check_type || 'TEXT_MATCH',
     message: ok ? 'OK' : (rule.message || '文字列が一致しません'),
