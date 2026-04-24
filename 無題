@@ -95,6 +95,11 @@ function fillRuleSeverityAndMessage() {
   );
 }
 
+// メニューからの呼び出し名（末尾アンダースコア）との互換用
+function fillRuleSeverityAndMessage_() {
+  return fillRuleSeverityAndMessage();
+}
+
 /**
  * メニュー追加
  */
