@@ -1025,7 +1025,8 @@ function resolveRuleSideValue_(ss, rule, side, ctx) {
     let decisionValue = resolveDecisionExprSimple_(ctx, valueExpr || key, matchMode);
 
     const isKilo = shouldApplyKiloScale_(rule, side, key);
-    if (decisionValue != null && isKilo) {
+    const alreadyKiloScaledByExpr = isExpressionAlreadyKiloScaled_(valueExpr || key);
+    if (decisionValue != null && isKilo && !alreadyKiloScaledByExpr) {
       decisionValue = Math.floor(decisionValue / 1000);
     }
 
@@ -1456,6 +1457,16 @@ function isLookupValueAlreadyKiloScaled_(lookupDef) {
   );
 }
 
+function isExpressionAlreadyKiloScaled_(expr) {
+  const s = String(expr || '').toUpperCase();
+  if (!s) return false;
+  return (
+    /\/\s*1000(?:\D|$)/.test(s) ||
+    /ROUNDDOWN\s*\(.+\/\s*1000\s*,\s*0\s*\)/.test(s) ||
+    /ROUND\s*\(.+\/\s*1000\s*,\s*0\s*\)/.test(s)
+  );
+}
+
 /* =========================
  * LOOKUP
  * ========================= */
@@ -1603,8 +1614,15 @@ function evaluateRowMathExpr_(row, expr) {
  * ========================= */
 
 function resolveDecisionExprSimple_(ctx, expr, matchMode) {
-  const text = String(expr || '').trim();
+  let text = String(expr || '').trim();
   if (!text) return null;
+
+  let divideBy1000 = false;
+  const divideMatch = text.match(/^\(?(.+?)\)?\s*\/\s*1000$/);
+  if (divideMatch) {
+    text = divideMatch[1].trim();
+    divideBy1000 = true;
+  }
 
   const tokens = text.match(/[+-]?[^+-]+/g);
   if (!tokens) return null;
@@ -1644,7 +1662,8 @@ function resolveDecisionExprSimple_(ctx, expr, matchMode) {
     }
   }
 
-  return foundAny ? total : null;
+  if (!foundAny) return null;
+  return divideBy1000 ? Math.floor(total / 1000) : total;
 }
 
 function findDecisionValueByMode_(decisionMap, name, matchMode) {
