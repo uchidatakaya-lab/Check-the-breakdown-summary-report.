@@ -999,7 +999,7 @@ function resolveRuleSideValue_(ss, rule, side, ctx) {
   const accountCol = side === 'src' ? rule.src_account_col : rule.dst_account_col;
   const amountCol = side === 'src' ? rule.src_amount_col : rule.dst_amount_col;
   let agg = String(side === 'src' ? rule.src_agg : rule.dst_agg).trim();
-  const valueExpr = String(side === 'src' ? rule.src_value_expr : rule.dst_value_expr).trim();
+  let valueExpr = String(side === 'src' ? rule.src_value_expr : rule.dst_value_expr).trim();
   const matchMode = String(rule.match_mode || '').trim();
 
   if (agg === '項目値') agg = 'FIRST';
@@ -1013,6 +1013,13 @@ function resolveRuleSideValue_(ss, rule, side, ctx) {
   if (agg === '決算書式') agg = 'DECISION_EXPR';
   if (agg === '検索定義') agg = 'LOOKUP';
   if (agg === 'セル計算式') agg = 'CELL_EXPR';
+
+  // シート設定上、照合先集計方法に式を誤って入力してしまった場合の救済
+  // 例: agg="課税売上 10%+課税売上 (軽)8%" / valueExpr=""
+  if (!valueExpr && /[+\-\/]/.test(agg) && accountCol && amountCol) {
+    valueExpr = agg;
+    agg = 'LAST_BY_ACCOUNT_EXPR';
+  }
 
   if (agg === 'DECISION_EXPR') {
     let decisionValue = resolveDecisionExprSimple_(ctx, valueExpr || key, matchMode);
@@ -1295,7 +1302,17 @@ function resolveSheetFirstExpressionValue_(values, expr, amountCol) {
 }
 
 function resolveSheetLastExpressionValue_(values, expr, accountCol, amountCol, matchMode) {
-  const tokens = String(expr || '').match(/[+\-]?[^+\-]+/g);
+  let rawExpr = String(expr || '').trim();
+  if (!rawExpr) return { value: null, a1: '' };
+
+  let divideBy1000 = false;
+  const divideMatch = rawExpr.match(/^\(?(.+?)\)?\s*\/\s*1000$/);
+  if (divideMatch) {
+    rawExpr = divideMatch[1].trim();
+    divideBy1000 = true;
+  }
+
+  const tokens = rawExpr.match(/[+\-]?[^+\-]+/g);
   if (!tokens) return { value: null, a1: '' };
 
   const accountIndex = colToIndex_(accountCol);
@@ -1335,8 +1352,13 @@ function resolveSheetLastExpressionValue_(values, expr, accountCol, amountCol, m
     if (!firstA1) firstA1 = toA1_(foundRow + 1, amountIndex + 1);
   }
 
+  if (!foundAny) {
+    return { value: null, a1: '' };
+  }
+
+  const finalValue = divideBy1000 ? Math.floor(total / 1000) : total;
   return {
-    value: foundAny ? total : null,
+    value: finalValue,
     a1: firstA1,
   };
 }
