@@ -999,7 +999,7 @@ function resolveRuleSideValue_(ss, rule, side, ctx) {
   const accountCol = side === 'src' ? rule.src_account_col : rule.dst_account_col;
   const amountCol = side === 'src' ? rule.src_amount_col : rule.dst_amount_col;
   let agg = String(side === 'src' ? rule.src_agg : rule.dst_agg).trim();
-  const valueExpr = String(side === 'src' ? rule.src_value_expr : rule.dst_value_expr).trim();
+  let valueExpr = String(side === 'src' ? rule.src_value_expr : rule.dst_value_expr).trim();
   const matchMode = String(rule.match_mode || '').trim();
 
   if (agg === '項目値') agg = 'FIRST';
@@ -1009,15 +1009,24 @@ function resolveRuleSideValue_(ss, rule, side, ctx) {
   if (agg === '科目別合計') agg = 'SUM_BY_ACCOUNT';
   if (agg === '科目正規化後の科目別合計') agg = 'SUM_BY_ACCOUNT_NORMALIZED';
   if (agg === '見出し列合計') agg = 'SUM_HEADER_COLUMN';
+  if (agg === '最下科目式') agg = 'LAST_BY_ACCOUNT_EXPR';
   if (agg === '決算書式') agg = 'DECISION_EXPR';
   if (agg === '検索定義') agg = 'LOOKUP';
   if (agg === 'セル計算式') agg = 'CELL_EXPR';
+
+  // シート設定上、照合先集計方法に式を誤って入力してしまった場合の救済
+  // 例: agg="課税売上 10%+課税売上 (軽)8%" / valueExpr=""
+  if (!valueExpr && /[+\-\/]/.test(agg) && accountCol && amountCol) {
+    valueExpr = agg;
+    agg = 'LAST_BY_ACCOUNT_EXPR';
+  }
 
   if (agg === 'DECISION_EXPR') {
     let decisionValue = resolveDecisionExprSimple_(ctx, valueExpr || key, matchMode);
 
     const isKilo = shouldApplyKiloScale_(rule, side, key);
-    if (decisionValue != null && isKilo) {
+    const alreadyKiloScaledByExpr = isExpressionAlreadyKiloScaled_(valueExpr || key);
+    if (decisionValue != null && isKilo && !alreadyKiloScaledByExpr) {
       decisionValue = Math.floor(decisionValue / 1000);
     }
 
@@ -1119,6 +1128,19 @@ function resolveRuleSideValue_(ss, rule, side, ctx) {
 
   if (agg === 'FIRST' && key && /[+\-]/.test(key)) {
     const exprValue = resolveSheetFirstExpressionValue_(values, key, amountCol);
+    return {
+      value: exprValue.value,
+      sheetName: sheet.getName(),
+      a1: exprValue.a1,
+    };
+  }
+
+  if (agg === 'LAST_BY_ACCOUNT_EXPR') {
+    if (!accountCol || !amountCol) {
+      return { value: null, sheetName: sheet.getName(), a1: '' };
+    }
+    const expr = valueExpr || key;
+    const exprValue = resolveSheetLastExpressionValue_(values, expr, accountCol, amountCol, matchMode);
     return {
       value: exprValue.value,
       sheetName: sheet.getName(),
@@ -1280,6 +1302,106 @@ function resolveSheetFirstExpressionValue_(values, expr, amountCol) {
   };
 }
 
+function resolveSheetLastExpressionValue_(values, expr, accountCol, amountCol, matchMode) {
+  let rawExpr = String(expr || '').trim();
+  if (!rawExpr) return { value: null, a1: '' };
+
+  let divideBy1000 = false;
+  const divideMatch = rawExpr.match(/^\(?(.+?)\)?\s*\/\s*1000$/);
+  if (divideMatch) {
+    rawExpr = divideMatch[1].trim();
+    divideBy1000 = true;
+  }
+
+  const tokens = rawExpr.match(/[+\-]?[^+\-]+/g);
+  if (!tokens) return { value: null, a1: '' };
+
+  const accountIndex = colToIndex_(accountCol);
+  const amountIndex = colToIndex_(amountCol);
+  if (accountIndex < 0 || amountIndex < 0) return { value: null, a1: '' };
+
+  let total = 0;
+  let foundAny = false;
+  let firstA1 = '';
+
+  for (const token of tokens) {
+    const raw = String(token || '').trim();
+    if (!raw) continue;
+
+    const sign = raw.startsWith('-') ? -1 : 1;
+    const tokenBody = stripOuterParens_(raw.replace(/^[+\-]/, '').trim());
+    if (!tokenBody) continue;
+
+    const parsed = parseLabelScaleExpr_(tokenBody);
+    const label = parsed.label;
+    if (!label) continue;
+
+    let foundRow = -1;
+
+    for (let r = values.length - 1; r >= 0; r--) {
+      const account = String(values[r][accountIndex] || '').trim();
+      if (!account) continue;
+      if (isTextMatchJa_(account, label, matchMode)) {
+        foundRow = r;
+        break;
+      }
+    }
+
+    if (foundRow < 0) continue;
+
+    const n = toNumber_(values[foundRow][amountIndex]);
+    if (n == null) continue;
+
+    let scaled = n;
+    if (parsed.op && parsed.operand != null) {
+      if (parsed.op === '*') {
+        scaled = scaled * parsed.operand;
+      } else if (parsed.op === '/') {
+        if (parsed.operand === 0) continue;
+        scaled = scaled / parsed.operand;
+      }
+    }
+
+    total += sign * scaled;
+    foundAny = true;
+    if (!firstA1) firstA1 = toA1_(foundRow + 1, amountIndex + 1);
+  }
+
+  if (!foundAny) {
+    return { value: null, a1: '' };
+  }
+
+  const finalValue = divideBy1000 ? Math.floor(total / 1000) : total;
+  return {
+    value: finalValue,
+    a1: firstA1,
+  };
+}
+
+function stripOuterParens_(text) {
+  let s = String(text || '').trim();
+  if (!s) return '';
+  while (s.startsWith('(') && s.endsWith(')')) {
+    const inner = s.slice(1, -1).trim();
+    if (!inner) return '';
+    s = inner;
+  }
+  return s;
+}
+
+function parseLabelScaleExpr_(tokenBody) {
+  const s = String(tokenBody || '').trim();
+  const m = s.match(/^(.+?)\s*([*/])\s*(-?\d+(?:\.\d+)?)$/);
+  if (!m) {
+    return { label: s, op: '', operand: null };
+  }
+  return {
+    label: String(m[1] || '').trim(),
+    op: String(m[2] || '').trim(),
+    operand: Number(m[3]),
+  };
+}
+
 function checkRequiredColumnIfAnyRow_(values, headerRow, triggerColIndex, requiredColIndex) {
   if (!values || values.length === 0) {
     return { isValid: true, a1: '' };
@@ -1332,6 +1454,16 @@ function isLookupValueAlreadyKiloScaled_(lookupDef) {
     /\/\s*1000(?:\D|$)/.test(expr) ||
     /ROUNDDOWN\s*\(.+\/\s*1000\s*,\s*0\s*\)/.test(expr) ||
     /ROUND\s*\(.+\/\s*1000\s*,\s*0\s*\)/.test(expr)
+  );
+}
+
+function isExpressionAlreadyKiloScaled_(expr) {
+  const s = String(expr || '').toUpperCase();
+  if (!s) return false;
+  return (
+    /\/\s*1000(?:\D|$)/.test(s) ||
+    /ROUNDDOWN\s*\(.+\/\s*1000\s*,\s*0\s*\)/.test(s) ||
+    /ROUND\s*\(.+\/\s*1000\s*,\s*0\s*\)/.test(s)
   );
 }
 
@@ -1482,8 +1614,15 @@ function evaluateRowMathExpr_(row, expr) {
  * ========================= */
 
 function resolveDecisionExprSimple_(ctx, expr, matchMode) {
-  const text = String(expr || '').trim();
+  let text = String(expr || '').trim();
   if (!text) return null;
+
+  let divideBy1000 = false;
+  const divideMatch = text.match(/^\(?(.+?)\)?\s*\/\s*1000$/);
+  if (divideMatch) {
+    text = divideMatch[1].trim();
+    divideBy1000 = true;
+  }
 
   const tokens = text.match(/[+-]?[^+-]+/g);
   if (!tokens) return null;
@@ -1523,7 +1662,8 @@ function resolveDecisionExprSimple_(ctx, expr, matchMode) {
     }
   }
 
-  return foundAny ? total : null;
+  if (!foundAny) return null;
+  return divideBy1000 ? Math.floor(total / 1000) : total;
 }
 
 function findDecisionValueByMode_(decisionMap, name, matchMode) {
