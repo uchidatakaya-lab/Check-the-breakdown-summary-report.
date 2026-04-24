@@ -1009,6 +1009,7 @@ function resolveRuleSideValue_(ss, rule, side, ctx) {
   if (agg === '科目別合計') agg = 'SUM_BY_ACCOUNT';
   if (agg === '科目正規化後の科目別合計') agg = 'SUM_BY_ACCOUNT_NORMALIZED';
   if (agg === '見出し列合計') agg = 'SUM_HEADER_COLUMN';
+  if (agg === '最下科目式') agg = 'LAST_BY_ACCOUNT_EXPR';
   if (agg === '決算書式') agg = 'DECISION_EXPR';
   if (agg === '検索定義') agg = 'LOOKUP';
   if (agg === 'セル計算式') agg = 'CELL_EXPR';
@@ -1119,6 +1120,19 @@ function resolveRuleSideValue_(ss, rule, side, ctx) {
 
   if (agg === 'FIRST' && key && /[+\-]/.test(key)) {
     const exprValue = resolveSheetFirstExpressionValue_(values, key, amountCol);
+    return {
+      value: exprValue.value,
+      sheetName: sheet.getName(),
+      a1: exprValue.a1,
+    };
+  }
+
+  if (agg === 'LAST_BY_ACCOUNT_EXPR') {
+    if (!accountCol || !amountCol) {
+      return { value: null, sheetName: sheet.getName(), a1: '' };
+    }
+    const expr = valueExpr || key;
+    const exprValue = resolveSheetLastExpressionValue_(values, expr, accountCol, amountCol, matchMode);
     return {
       value: exprValue.value,
       sheetName: sheet.getName(),
@@ -1272,6 +1286,53 @@ function resolveSheetFirstExpressionValue_(values, expr, amountCol) {
     total += sign * n;
     foundAny = true;
     if (!firstA1) firstA1 = toA1_(found.row + 1, colIndex + 1);
+  }
+
+  return {
+    value: foundAny ? total : null,
+    a1: firstA1,
+  };
+}
+
+function resolveSheetLastExpressionValue_(values, expr, accountCol, amountCol, matchMode) {
+  const tokens = String(expr || '').match(/[+\-]?[^+\-]+/g);
+  if (!tokens) return { value: null, a1: '' };
+
+  const accountIndex = colToIndex_(accountCol);
+  const amountIndex = colToIndex_(amountCol);
+  if (accountIndex < 0 || amountIndex < 0) return { value: null, a1: '' };
+
+  let total = 0;
+  let foundAny = false;
+  let firstA1 = '';
+
+  for (const token of tokens) {
+    const raw = String(token || '').trim();
+    if (!raw) continue;
+
+    const sign = raw.startsWith('-') ? -1 : 1;
+    const label = raw.replace(/^[+\-]/, '').trim();
+    if (!label) continue;
+
+    let foundRow = -1;
+
+    for (let r = values.length - 1; r >= 0; r--) {
+      const account = String(values[r][accountIndex] || '').trim();
+      if (!account) continue;
+      if (isTextMatchJa_(account, label, matchMode)) {
+        foundRow = r;
+        break;
+      }
+    }
+
+    if (foundRow < 0) continue;
+
+    const n = toNumber_(values[foundRow][amountIndex]);
+    if (n == null) continue;
+
+    total += sign * n;
+    foundAny = true;
+    if (!firstA1) firstA1 = toA1_(foundRow + 1, amountIndex + 1);
   }
 
   return {
